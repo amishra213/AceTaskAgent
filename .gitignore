@@ -1,0 +1,67 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environments
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+
+# Logging
+*.log
+logs/
+
+# Results
+task_manager_results.json
+results/
+examples/configuration_examples.py
+examples/debug_deep_search.py
+examples/debug_structured_data.py
+examples/karnataka_data_collection.py
+examples/test_agent_deep_search.py
+examples/test_api_endpoint_configuration.py
+examples/test_deep_search.py
+examples/test_districts_deep_search.py
+examples/test_karnataka_deep_search.py
+examples/test_language_detection.py
+examples/test_llm_client_providers.py
+examples/test_websearch_comprehensive.py
+examples/vision_analysis_examples.py
+temp_folder/trends_analysis.xlsx
