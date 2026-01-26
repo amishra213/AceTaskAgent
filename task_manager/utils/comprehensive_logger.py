@@ -8,17 +8,31 @@ Features:
 - Structured logging with context
 - Log rotation and archival
 - Performance metrics tracking
+- Unicode support on Windows
 """
 
 import logging
 import logging.handlers
 import sys
 import os
+import codecs
 from pathlib import Path
 from typing import Optional, Dict, Any, Literal, cast
 from datetime import datetime
 import json
 import traceback
+
+# Fix Unicode support on Windows BEFORE any logging is configured
+if sys.platform == 'win32':
+    try:
+        # Check encoding before wrapping
+        if hasattr(sys.stdout, 'encoding') and sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
+            # Wrap stdout with UTF-8 codec writer for Windows
+            sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'backslashreplace')
+            sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer, 'backslashreplace')
+    except (AttributeError, TypeError):
+        # In case buffer attribute is not available
+        pass
 
 try:
     from langfuse import Langfuse
@@ -213,6 +227,9 @@ class TaskLogger:
     
     def _add_file_handler(self) -> None:
         """Add rotating file handler."""
+        # Ensure log folder exists
+        Path(self.log_folder).mkdir(parents=True, exist_ok=True)
+        
         log_file = os.path.join(self.log_folder, f"{self.name}.log")
         
         try:
