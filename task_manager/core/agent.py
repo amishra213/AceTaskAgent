@@ -2236,6 +2236,53 @@ class TaskManagerAgent:
                 **response['result']  # Include all other result fields
             }
             
+            # NORMALIZATION: For regular search operations, convert 'results' to 'extracted_data' and 'findings'
+            # This ensures consistency with deep_search output format for downstream processing
+            if operation == 'search' and 'results' in result_data and 'extracted_data' not in result_data:
+                # Convert search results to extracted_data format
+                search_results = result_data.get('results', [])
+                
+                # Create extracted_data from snippets (with fallback fields in case of naming differences)
+                result_data['extracted_data'] = []
+                for r in search_results:
+                    # Try snippet field first, then fall back to body, then title
+                    snippet = r.get('snippet', '') or r.get('body', '') or r.get('title', '')
+                    if isinstance(snippet, str) and snippet.strip():
+                        result_data['extracted_data'].append(snippet)
+                
+                # Create findings from full result objects  
+                result_data['findings'] = []
+                for r in search_results:
+                    snippet = r.get('snippet', '') or r.get('body', '') or r.get('title', '')
+                    # Only include findings that have at least a URL or title
+                    if r.get('url', '') or r.get('title', ''):
+                        result_data['findings'].append({
+                            'url': r.get('url', ''),
+                            'title': r.get('title', ''),
+                            'relevance_score': 0.8,  # Regular search results are considered highly relevant
+                            'text_preview': (snippet[:500] if isinstance(snippet, str) else str(snippet)[:500])
+                        })
+                
+                # Generate summary if empty
+                if not result_data.get('summary'):
+                    result_data['summary'] = {
+                        'query': result_data.get('query', ''),
+                        'total_results': len(search_results),
+                        'top_sources': [r.get('url', '') for r in search_results[:5] if r.get('url', '')],
+                        'snippet_count': len(result_data['extracted_data'])
+                    }
+                
+                logger.debug(f"[WEB SEARCH AGENT] Normalized search results: {len(result_data['extracted_data'])} items, {len(result_data['findings'])} findings")
+                
+                # CRITICAL: Ensure we have data after normalization
+                if result_data.get('results_count', 0) > 0 and not result_data.get('extracted_data', []):
+                    logger.warning(f"[WEB SEARCH AGENT] WARNING: results_count={result_data.get('results_count')} but extracted_data is empty after normalization!")
+                    logger.warning(f"[WEB SEARCH AGENT] Sample result structure: {search_results[0] if search_results else 'N/A'}")
+                    # Try alternate approach - if all else fails, use stringified results
+                    if search_results:
+                        result_data['extracted_data'] = [str(r) for r in search_results]
+                        result_data['findings'] = [{'url': str(idx), 'title': str(r), 'relevance_score': 0.8} for idx, r in enumerate(search_results)]
+            
             # Update task with results
             updated_task = {
                 **task,
@@ -2265,6 +2312,20 @@ class TaskManagerAgent:
             logger.info(f"[WEB SEARCH AGENT] Success Flag: {result_data.get('success')}")
             logger.info(f"[WEB SEARCH AGENT] Task Status Set To: {updated_task['status']}")
             logger.info(f"[WEB SEARCH AGENT] Status Enum Value: {updated_task['status'].value if hasattr(updated_task['status'], 'value') else 'N/A'}")
+            
+            # CRITICAL CHECK: Ensure successful search actually has results
+            if task_success and operation == 'search':
+                results_count = result_data.get('results_count', 0)
+                extracted_count = len(result_data.get('extracted_data', []))
+                findings_count = len(result_data.get('findings', []))
+                
+                if results_count > 0 and extracted_count == 0 and findings_count == 0:
+                    logger.error(f"[WEB SEARCH AGENT] CRITICAL: Search returned results_count={results_count} but NO extracted_data or findings!")
+                    logger.error(f"[WEB SEARCH AGENT] Result structure: {json.dumps({k: type(v).__name__ for k, v in result_data.items()}, indent=2)}")
+                    # Mark as failed since data extraction failed
+                    updated_task['status'] = TaskStatus.FAILED
+                    updated_task['error'] = "Search returned results but data extraction failed"
+                    task_success = False
             
             # Log retry information if available
             retry_count = result_data.get('retry_count', 0)
