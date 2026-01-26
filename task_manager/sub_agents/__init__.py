@@ -9,6 +9,8 @@ This module provides dedicated sub-agents for handling:
 - Code interpretation and execution (generate and execute Python code for data analysis)
 - Data extraction (intelligent extraction of relevant data from input/temp files)
 - Problem solving (LLM-based error analysis, solution generation, human input interpretation)
+- Document creation (create and manage TXT and DOCX files)
+- Mermaid diagrams (create flowcharts, sequence diagrams, and other visualizations)
 """
 
 from .pdf_agent import PDFAgent
@@ -18,6 +20,8 @@ from .web_search_agent import WebSearchAgent
 from .code_interpreter_agent import CodeInterpreterAgent
 from .data_extraction_agent import DataExtractionAgent
 from .problem_solver_agent import ProblemSolverAgent
+from .document_agent import DocumentAgent
+from .mermaid_agent import MermaidAgent
 
 __all__ = [
     "PDFAgent",
@@ -27,4 +31,6 @@ __all__ = [
     "CodeInterpreterAgent",
     "DataExtractionAgent",
     "ProblemSolverAgent",
+    "DocumentAgent",
+    "MermaidAgent",
 ]

@@ -294,6 +294,8 @@ class WorkflowBuilder:
         
         # Normal case: continue to analyze the selected task
         logger.debug(f"[ROUTE AFTER SELECT] Active task {active_task_id} set - continuing to analyze_task")
+        print(f">>> [ROUTE AFTER SELECT] Returning 'analyze_task' for task {active_task_id}", flush=True)
+        logger.info(f">>> [ROUTE AFTER SELECT] Returning 'analyze_task' for task {active_task_id}")
         return "analyze_task"
     
     def _route_after_aggregate(self, state: "AgentState") -> Literal["human_review", "synthesize", "continue", "complete", "max_iterations"]:

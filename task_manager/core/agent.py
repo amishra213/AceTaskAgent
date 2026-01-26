@@ -223,6 +223,23 @@ class TaskManagerAgent:
                     kwargs.update(self.config.llm.extra_params)
                     return ChatOpenAI(**kwargs)
             
+            elif provider == "deepseek":
+                # DeepSeek uses OpenAI-compatible API
+                from langchain_openai import ChatOpenAI
+                
+                # Use configured base_url or api_base_url if provided, otherwise default
+                base_url = self.config.llm.base_url or self.config.llm.api_base_url or "https://api.deepseek.com/v1"
+                
+                kwargs = {
+                    "model": self.config.llm.model_name,
+                    "temperature": self.config.llm.temperature,
+                    "base_url": base_url
+                }
+                if self.config.llm.api_key:
+                    kwargs["api_key"] = self.config.llm.api_key
+                kwargs.update(self.config.llm.extra_params)
+                return ChatOpenAI(**kwargs)
+            
             elif provider == "local":
                 from langchain_community.llms import Ollama
                 
@@ -238,7 +255,7 @@ class TaskManagerAgent:
                 raise InvalidParameterError(
                     parameter_name="provider",
                     message=f"Unsupported LLM provider: {provider}. "
-                    f"Supported providers: anthropic, openai, google, groq, local"
+                    f"Supported providers: anthropic, openai, google, groq, deepseek, local"
                 )
         except ImportError as e:
             raise MissingDependencyError(
@@ -481,6 +498,18 @@ class TaskManagerAgent:
         print(">>> ENTERED _select_next_task", flush=True)
         logger.info(">>> ENTERED _select_next_task")
         
+        # Check state health
+        try:
+            state_keys = list(state.keys())
+            tasks_count = len(state.get('tasks', []))
+            iteration = state.get('iteration_count', 0)
+            blackboard_size = len(state.get('blackboard', []))
+            print(f">>> [STATE CHECK] Keys: {len(state_keys)}, Tasks: {tasks_count}, Iter: {iteration}, Blackboard: {blackboard_size}", flush=True)
+            logger.debug(f"[STATE CHECK] State keys: {len(state_keys)}, tasks: {tasks_count}, iteration: {iteration}, blackboard: {blackboard_size}")
+        except Exception as e:
+            logger.error(f"[STATE CHECK] Error checking state: {e}")
+            print(f">>> [STATE CHECK ERROR] {e}", flush=True)
+        
         # Log task hierarchy summary periodically (every 5 iterations)
         if state['iteration_count'] % 5 == 0 and state['iteration_count'] > 0:
             self._log_task_hierarchy_summary(state)
@@ -562,12 +591,21 @@ class TaskManagerAgent:
     
     def _analyze_task(self, state: AgentState) -> AgentState:
         """Analyze current task using LLM to decide next action."""
+        # IMMEDIATE LOGGING - to detect if this method is even being called
+        print(">>> ENTERED _analyze_task", flush=True)
+        logger.info(">>> ENTERED _analyze_task")
+        
         task_id = state['active_task_id']
         
         if not task_id:
+            logger.warning("[ANALYZE] No active_task_id - returning state unchanged")
             return state
         
-        task = next(t for t in state['tasks'] if t['id'] == task_id)
+        try:
+            task = next(t for t in state['tasks'] if t['id'] == task_id)
+        except StopIteration:
+            logger.error(f"[ANALYZE] Task {task_id} not found in tasks list!")
+            return state
         
         logger.info(f"[ANALYZE] Analyzing task {task_id}...")
         
@@ -604,6 +642,8 @@ class TaskManagerAgent:
                 "requires_human_review": False
             }
             
+            logger.info(f"[ANALYZE] Forced analysis action: {analysis['action']}")
+            
             updated_task: Task = {
                 **task,
                 "status": TaskStatus.ANALYZING,
@@ -615,6 +655,8 @@ class TaskManagerAgent:
                 updated_task if t['id'] == task_id else t
                 for t in state['tasks']
             ]
+            
+            logger.info(f"[ANALYZE] ✓ Task {task_id} forced to execute - returning updated state")
             
             return {
                 **state,
@@ -664,6 +706,8 @@ class TaskManagerAgent:
                 for t in state['tasks']
             ]
             
+            logger.info(f"[ANALYZE] ✓ Task {task_id} analyzed - returning updated state")
+            
             return {
                 **state,
                 "tasks": updated_tasks,
@@ -672,6 +716,7 @@ class TaskManagerAgent:
             
         except Exception as e:
             logger.error(f"[ANALYZE] Error: {str(e)}")
+            logger.exception(e)
             
             # Update task with error
             updated_task: Task = {
@@ -685,6 +730,8 @@ class TaskManagerAgent:
                 updated_task if t['id'] == task_id else t
                 for t in state['tasks']
             ]
+            
+            logger.warning(f"[ANALYZE] ✗ Task {task_id} failed during analysis - returning error state")
             
             return {
                 **state,
@@ -1131,8 +1178,25 @@ class TaskManagerAgent:
                 parameters['source_agent'] = source_data_type
                 parameters['source_task'] = source_task_from_chain
             
+            # ENHANCEMENT: Generate sample filename with task_id and timestamp if not provided
+            # This prevents errors when LLM doesn't provide proper file paths
+            if operation == 'create' and not parameters.get('file_path') and not parameters.get('output_path'):
+                # Generate safe filename from task_id and timestamp
+                safe_task_id = task_id.replace('.', '_')
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                default_filename = f"excel_output_{safe_task_id}_{timestamp}.xlsx"
+                # Use output_path (not temp_path) for final Excel files
+                parameters['output_path'] = str(self.config.folders.output_path / default_filename)
+                logger.info(f"[EXCEL AGENT] Generated default filename in output folder: {default_filename}")
+                logger.info(f"[EXCEL AGENT] Full path: {parameters['output_path']}")
+            
+            # Also ensure folder_path uses output_folder if not specified
+            if operation == 'create' and not parameters.get('folder_path'):
+                parameters['folder_path'] = str(self.config.folders.output_path)
+                logger.info(f"[EXCEL AGENT] Using output folder: {parameters['folder_path']}")
+            
             logger.info(f"[EXCEL AGENT] Operation: {operation}")
-            logger.info(f"[EXCEL AGENT] File: {parameters.get('file_path', 'N/A')[:80]}...")
+            logger.info(f"[EXCEL AGENT] File: {parameters.get('file_path', parameters.get('output_path', 'N/A'))[:80]}...")
             logger.info(f"[EXCEL AGENT] Parameters: {parameters}")
             logger.info("-" * 80)
             
@@ -1153,8 +1217,9 @@ class TaskManagerAgent:
                 "max_retries": 3
             }
             
-            # Execute using standardized interface
-            response = cast(AgentExecutionResponse, self.excel_agent.execute_task(request=request))
+            # Execute using standardized interface - pass as single positional argument
+            # ExcelAgent.execute_task expects: execute_task(request) NOT execute_task(request=request)
+            response = cast(AgentExecutionResponse, self.excel_agent.execute_task(request))
             
             # Extract legacy-compatible result_data from standardized response
             result_data = {
@@ -1236,12 +1301,96 @@ class TaskManagerAgent:
         except Exception as e:
             logger.error(f"[EXCEL AGENT] ✗ FAILED: Error executing task")
             logger.error(f"[EXCEL AGENT] Exception: {str(e)}")
+            logger.error(f"[EXCEL AGENT] Exception Type: {type(e).__name__}")
             logger.info("=" * 80)
             
+            # ============================================================
+            # ERROR RECOVERY: Use ProblemSolverAgent for error analysis
+            # ============================================================
+            error_analysis = None
+            suggested_solutions = None
+            
+            try:
+                logger.info(f"[EXCEL AGENT] Invoking ProblemSolverAgent for error analysis...")
+                
+                task_context = {
+                    'task_id': task_id,
+                    'description': task['description'],
+                    'operation': file_operation.get('operation', 'unknown') if 'file_operation' in locals() else 'unknown',
+                    'parameters': parameters if 'parameters' in locals() else {},
+                }
+                
+                # Diagnose the error
+                diagnose_request: AgentExecutionRequest = {
+                    "task_id": f"diagnose_{task_id}",
+                    "task_description": "Diagnose Excel agent error",
+                    "task_type": "atomic",
+                    "operation": "diagnose_error",
+                    "parameters": {
+                        "error_message": str(e),
+                        "task_context": task_context,
+                        "agent_type": "excel"
+                    },
+                    "input_data": {},
+                    "temp_folder": str(self.config.folders.temp_path),
+                    "output_folder": str(self.config.folders.output_path),
+                    "cache_enabled": False,
+                    "blackboard": cast(list[dict[str, Any]], state.get('blackboard', [])),
+                    "relevant_entries": [],
+                    "max_retries": 1
+                }
+                
+                diagnose_response = cast(AgentExecutionResponse, self.problem_solver_agent.execute_task(diagnose_request))
+                error_analysis = diagnose_response.get('result', {}) if diagnose_response['success'] else None
+                
+                if error_analysis:
+                    logger.info(f"[EXCEL AGENT] Error diagnosis: category={error_analysis.get('error_category')}")
+                
+                # Get solution suggestions
+                solution_request: AgentExecutionRequest = {
+                    "task_id": f"solution_{task_id}",
+                    "task_description": "Get solution for Excel agent error",
+                    "task_type": "atomic",
+                    "operation": "get_solution",
+                    "parameters": {
+                        "error_message": str(e),
+                        "task_context": task_context,
+                        "agent_type": "excel"
+                    },
+                    "input_data": {},
+                    "temp_folder": str(self.config.folders.temp_path),
+                    "output_folder": str(self.config.folders.output_path),
+                    "cache_enabled": False,
+                    "blackboard": cast(list[dict[str, Any]], state.get('blackboard', [])),
+                    "relevant_entries": [],
+                    "max_retries": 1
+                }
+                
+                solution_response = cast(AgentExecutionResponse, self.problem_solver_agent.execute_task(solution_request))
+                suggested_solutions = solution_response.get('result', {}) if solution_response['success'] else None
+                
+                if suggested_solutions:
+                    logger.info(f"[EXCEL AGENT] Suggested solution type: {suggested_solutions.get('solution_type')}")
+                    
+            except Exception as err_e:
+                logger.warning(f"[EXCEL AGENT] ProblemSolverAgent analysis failed: {str(err_e)}")
+            
+            # Store error details with AI analysis in the task
             updated_task = {
                 **task,
                 "status": TaskStatus.FAILED,
                 "error": str(e),
+                "error_type": type(e).__name__,
+                "result": {
+                    "error": str(e),
+                    "error_analysis": error_analysis,
+                    "suggested_solutions": suggested_solutions,
+                    "error_context": {
+                        "operation": file_operation.get('operation', 'unknown') if 'file_operation' in locals() else 'unknown',
+                        "parameters": parameters if 'parameters' in locals() else {},
+                        "agent": "excel_agent"
+                    }
+                },
                 "updated_at": datetime.now().isoformat()
             }
             
@@ -1250,10 +1399,17 @@ class TaskManagerAgent:
                 for t in state['tasks']
             ]
             
+            # Set requires_human_review to trigger human review workflow
+            # The human_review node will display the AI analysis and solutions
+            logger.warning(f"[EXCEL AGENT] Setting requires_human_review=True to trigger human review workflow")
+            logger.warning(f"[EXCEL AGENT] AI error analysis and solutions have been prepared for human review")
+            
             return {
                 **state,
                 "tasks": updated_tasks,  # type: ignore
-                "failed_task_ids": [task_id]
+                "failed_task_ids": [task_id],
+                "requires_human_review": True,  # Trigger human review workflow
+                "active_task_id": task_id  # Keep task active for human review
             }
     
     
@@ -1555,6 +1711,8 @@ class TaskManagerAgent:
         - File pointer setup for downstream agents
         - Automatic deep_search detection for comprehensive extraction
         """
+        print(">>> ENTERED _execute_web_search_task node", flush=True)
+        logger.info(">>> ENTERED _execute_web_search_task node")
         logger.info("🔹 ENTERED _execute_web_search_task node")
         
         task_id = state['active_task_id']
@@ -3489,6 +3647,8 @@ Respond with JSON:
         
         action = analysis.get('action', 'handle_error')
         
+        logger.info(f"[ROUTE] 🔥 DEBUG: Original action from analysis: '{action}'")
+        
         # Normalize action names - handle variations from LLM responses
         # Map shorthand actions to their full execute_* equivalents
         action_mapping = {
@@ -3511,6 +3671,8 @@ Respond with JSON:
             "execute": "execute_task",
         }
         action = action_mapping.get(action, action)
+        
+        logger.info(f"[ROUTE] 🔥 DEBUG: Mapped action: '{action}'")
         
         # Priority 1: Human review (if required and not breakdown)
         if state.get('requires_human_review', False) and action != "breakdown":
@@ -3538,6 +3700,8 @@ Respond with JSON:
             return "execute_ocr_task"
         elif action == "execute_web_search_task":
             logger.info(f"[ROUTE] Routing to WebSearch task executor for {task_id}")
+            logger.warning(f"[ROUTE] 🔥 DEBUG: About to return 'execute_web_search_task' for task {task_id}")
+            print(f">>> [ROUTE] Returning 'execute_web_search_task' for task {task_id}", flush=True)
             return "execute_web_search_task"
         elif action == "execute_code_interpreter_task":
             logger.info(f"[ROUTE] Routing to Code Interpreter task executor for {task_id}")
@@ -3547,6 +3711,7 @@ Respond with JSON:
             return "execute_data_extraction_task"
         else:
             logger.error(f"[ROUTE] Unknown action '{action}' for task {task_id}")
+            logger.warning(f"[ROUTE] 🔥 DEBUG: Action not recognized, returning 'handle_error'")
             return "handle_error"
     
     

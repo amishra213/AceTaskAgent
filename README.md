@@ -13,7 +13,7 @@ A production-ready LangGraph-based orchestration system that recursively decompo
 - **Research Synthesis**: Auto-detect and flag data contradictions with human escalation
 - **Agentic Debate**: Consensus-based validation with Fact-Checker & Lead Researcher personas for high-confidence conflict resolution
 - **Multimodal Vision**: Charts, diagrams, heatmaps analyzed via LLM vision models
-- **Multi-Provider Support**: Anthropic Claude, OpenAI GPT, Google Gemini, Local Ollama
+- **Multi-Provider Support**: Anthropic Claude, OpenAI GPT, Google Gemini, Groq, DeepSeek, Local Ollama
 - **Flexible API Configuration**: Generic LLM endpoint configuration for any provider (no vendor lock-in)
 - **Knowledge Sharing**: Blackboard pattern for findings across hierarchy levels
 - **State Persistence**: LangGraph checkpointing for fault tolerance
@@ -72,7 +72,8 @@ pip install langchain langchain-core python-dotenv langgraph
 
 # Choose LLM provider
 pip install langchain-anthropic      # Recommended
-# OR: pip install langchain-openai / langchain-google-genai
+# OR: pip install langchain-openai / langchain-google-genai / langchain-groq
+# Note: DeepSeek uses OpenAI-compatible API (langchain-openai)
 
 # For observability (optional)
 pip install langfuse
@@ -233,6 +234,8 @@ agent = TaskManagerAgent(objective="...", config=config)
 | **Anthropic** | claude-sonnet-4-20250514 | `pip install langchain-anthropic` | High quality |
 | **OpenAI** | gpt-4-turbo | `pip install langchain-openai` | Premium |
 | **Google** | gemini-pro | `pip install langchain-google-genai` | Cost-effective |
+| **Groq** | llama-3.3-70b-versatile | `pip install langchain-groq` | Fast inference |
+| **DeepSeek** | deepseek-chat | `pip install langchain-openai` | Cost-effective |
 | **Ollama** | llama2 | Local: `ollama serve` | Free |
 
 **Configuration Examples**:
@@ -251,6 +254,16 @@ config = AgentConfig(
 # Google
 config = AgentConfig(
     llm=LLMConfig(provider="google", model_name="gemini-pro")
+)
+
+# Groq (fast inference)
+config = AgentConfig(
+    llm=LLMConfig(provider="groq", model_name="llama-3.3-70b-versatile")
+)
+
+# DeepSeek (cost-effective)
+config = AgentConfig(
+    llm=LLMConfig(provider="deepseek", model_name="deepseek-chat")
 )
 
 # Local Ollama

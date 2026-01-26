@@ -18,6 +18,7 @@ class LLMProvider(str, Enum):
     OPENAI = "openai"
     GOOGLE = "google"
     GROQ = "groq"
+    DEEPSEEK = "deepseek"
     LOCAL = "local"
 
 
@@ -27,7 +28,7 @@ class LLMConfig:
     Configuration for LLM provider and model.
     
     Attributes:
-        provider: LLM provider (anthropic, openai, google, local)
+        provider: LLM provider (anthropic, openai, google, groq, deepseek, local)
         model_name: Model identifier for the provider
         api_key: API key for the provider (reads from LLM_API_KEY env if not provided)
         base_url: Base URL for API (useful for local/custom servers)
@@ -87,6 +88,7 @@ class LLMConfig:
             "openai": "OPENAI_API_KEY",
             "google": "GOOGLE_API_KEY",
             "groq": "GROQ_API_KEY",
+            "deepseek": "DEEPSEEK_API_KEY",
             "local": "LOCAL_LLM_URL"
         }
         return env_vars.get(self.provider, f"{self.provider.upper()}_API_KEY")
@@ -322,6 +324,12 @@ class AgentConfig:
             llm=LLMConfig(
                 provider=os.getenv(f"{prefix}LLM_PROVIDER", "anthropic"),
                 model_name=os.getenv(f"{prefix}LLM_MODEL", "claude-sonnet-4-20250514"),
+                api_key=os.getenv("LLM_API_KEY"),  # Read from LLM_API_KEY env var
+                base_url=os.getenv("LLM_API_BASE_URL"),  # Read from LLM_API_BASE_URL env var
+                api_base_url=os.getenv("LLM_API_BASE_URL"),  # Also set api_base_url for compatibility
+                temperature=float(os.getenv(f"{prefix}LLM_TEMPERATURE", "0.2")),
+                max_tokens=int(os.getenv(f"{prefix}LLM_MAX_TOKENS")) if os.getenv(f"{prefix}LLM_MAX_TOKENS") else None,
+                timeout=int(os.getenv(f"{prefix}TIMEOUT", "30")),
             ),
             rate_limit=RateLimitConfig.from_env(),
             folders=FolderConfig.from_env(prefix),
