@@ -41,6 +41,34 @@ except ImportError:
     HAS_LANGFUSE = False
 
 
+class SafeStreamHandler(logging.StreamHandler):
+    """
+    Custom StreamHandler that safely handles Unicode on Windows.
+    Uses 'replace' error handling to avoid UnicodeEncodeError.
+    """
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            stream = self.stream
+            # Handle encoding carefully on Windows
+            if hasattr(stream, 'buffer'):
+                # Use buffer with UTF-8 encoding and replace errors
+                stream.buffer.write((msg + self.terminator).encode('utf-8', errors='replace'))
+                stream.buffer.flush()
+            else:
+                # Fallback to regular write with error handling
+                try:
+                    stream.write(msg + self.terminator)
+                except UnicodeEncodeError:
+                    # Replace problematic characters with '?'
+                    safe_msg = msg.encode(stream.encoding or 'utf-8', errors='replace').decode(stream.encoding or 'utf-8')
+                    stream.write(safe_msg + self.terminator)
+                self.flush()
+        except Exception:
+            # Silently ignore encoding errors - don't call handleError which prints to stderr
+            pass
+
+
 class ComprehensiveLogger:
     """
     Centralized logging system with file, console, and Langfuse support.
@@ -214,8 +242,9 @@ class TaskLogger:
             self._add_file_handler()
     
     def _add_console_handler(self) -> None:
-        """Add console handler with colored output."""
-        handler = logging.StreamHandler(sys.stdout)
+        """Add console handler with Unicode-safe output."""
+        # Use custom SafeStreamHandler instead of regular StreamHandler
+        handler = SafeStreamHandler(sys.stdout)
         handler.setLevel(self.config.get("log_level", "INFO"))
         
         formatter = logging.Formatter(
@@ -226,7 +255,7 @@ class TaskLogger:
         self.logger.addHandler(handler)
     
     def _add_file_handler(self) -> None:
-        """Add rotating file handler."""
+        """Add rotating file handler with UTF-8 encoding."""
         # Ensure log folder exists
         Path(self.log_folder).mkdir(parents=True, exist_ok=True)
         
@@ -236,7 +265,8 @@ class TaskLogger:
             handler = logging.handlers.RotatingFileHandler(
                 log_file,
                 maxBytes=self.config.get("max_bytes", 10 * 1024 * 1024),
-                backupCount=self.config.get("backup_count", 5)
+                backupCount=self.config.get("backup_count", 5),
+                encoding='utf-8'  # Ensure UTF-8 encoding for Unicode support
             )
             handler.setLevel(self.config.get("log_level", "INFO"))
             

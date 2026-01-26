@@ -171,12 +171,15 @@ class WorkflowBuilder:
         # Auto-synthesis always goes to aggregate (observer pattern completes)
         workflow.add_edge("auto_synthesis", "aggregate_results")
         
-        # After aggregation, route to synthesis if all tasks complete
-        # This enables multi-level research synthesis with conflict detection
+        # After aggregation, route based on task status:
+        # - Failed tasks → human_review (for resolution decision)
+        # - All tasks complete → synthesize_research
+        # - Otherwise → continue or complete check
         workflow.add_conditional_edges(
             "aggregate_results",
-            self._route_to_synthesis_or_continue,
+            self._route_after_aggregate,
             {
+                "human_review": "human_review",
                 "synthesize": "synthesize_research",
                 "continue": "select_task",
                 "complete": END,
@@ -212,8 +215,11 @@ class WorkflowBuilder:
         # Error handling
         workflow.add_edge("handle_error", "select_task")
         
-        # Human review - after review, route based on task status
-        # Check if task needs breakdown
+        # Human review - route based on outcome of review
+        # After human review, task could be:
+        # 1. Reset to PENDING (restart with new context) → analyze_task
+        # 2. Marked as COMPLETED (human provided output) → select_task
+        # 3. Marked as FAILED (ignored) → select_task
         def route_after_human_review(state):
             task_id = state.get('active_task_id')
             if not task_id:
@@ -223,19 +229,21 @@ class WorkflowBuilder:
             if not task:
                 return "select_task"
             
-            # If analysis suggests breakdown, go to breakdown
-            analysis = task.get('result', {})
-            if isinstance(analysis, dict) and analysis.get('action') == 'breakdown':
-                return "breakdown"
+            # If task was reset to PENDING (restart scenario), re-analyze it
+            if task.get('status') == TaskStatus.PENDING:
+                logger.info(f"[ROUTE AFTER REVIEW] Task {task_id} reset to PENDING - routing to analyze_task for retry")
+                return "analyze_task"
             
+            # If task was completed with human input or marked as failed/ignored, continue
             # Otherwise continue with selection
+            logger.info(f"[ROUTE AFTER REVIEW] Task {task_id} status: {task.get('status')} - routing to select_task")
             return "select_task"
         
         workflow.add_conditional_edges(
             "human_review",
             route_after_human_review,
             {
-                "breakdown": "breakdown_task",
+                "analyze_task": "analyze_task",
                 "select_task": "select_task"
             }
         )
@@ -277,11 +285,45 @@ class WorkflowBuilder:
                 return "complete"
             else:
                 # This shouldn't happen, but log it if it does
-                logger.warning(f"[ROUTE AFTER SELECT] Found {len(pending_tasks)} pending tasks but no active_task_id set!")
+                logger.error(f"[ROUTE AFTER SELECT] CRITICAL: Found {len(pending_tasks)} pending tasks but no active_task_id set!")
+                logger.error(f"[ROUTE AFTER SELECT] Pending task IDs: {[t['id'] for t in pending_tasks[:10]]}")
+                logger.error(f"[ROUTE AFTER SELECT] This indicates a bug in task selection logic")
+                logger.error(f"[ROUTE AFTER SELECT] Will attempt to continue to analyze_task anyway")
+                # Force continue despite the issue - this is a safeguard
                 return "analyze_task"
         
         # Normal case: continue to analyze the selected task
+        logger.debug(f"[ROUTE AFTER SELECT] Active task {active_task_id} set - continuing to analyze_task")
         return "analyze_task"
+    
+    def _route_after_aggregate(self, state: "AgentState") -> Literal["human_review", "synthesize", "continue", "complete", "max_iterations"]:
+        """
+        Route after aggregate_results based on task status and workflow state.
+        
+        Priority routing:
+        1. If requires_human_review is set → human_review (for failed tasks)
+        2. If all tasks complete and multi-agent findings → synthesize
+        3. Otherwise → continue/complete check
+        
+        Args:
+            state: Current agent state
+            
+        Returns:
+            Route destination
+        """
+        logger.info("=" * 80)
+        logger.info("[WORKFLOW ROUTING] aggregate_results → review/synthesis/continue/complete check")
+        logger.info("=" * 80)
+        
+        # Check if human review is required (e.g., for failed tasks)
+        if state.get('requires_human_review', False):
+            logger.warning("[ROUTING] Human review required (failed task) → routing to human_review")
+            logger.info("=" * 80)
+            return "human_review"
+        
+        # Otherwise delegate to synthesis/continue routing
+        result = self._route_to_synthesis_or_continue(state)
+        return result  # type: ignore
     
     def _route_to_synthesis_or_continue(self, state: "AgentState") -> Literal["synthesize", "continue", "complete", "max_iterations"]:
         """
@@ -318,6 +360,15 @@ class WorkflowBuilder:
         logger.info(f"[ROUTING]   Total tasks: {len(tasks)}")
         logger.info(f"[ROUTING]   Completed: {len(completed)}")
         logger.info(f"[ROUTING]   Failed: {len(failed)}")
+        
+        # Count pending tasks
+        pending_tasks = [
+            t for t in tasks 
+            if t['id'] not in completed 
+            and t['id'] not in failed
+            and t.get('status') == TaskStatus.PENDING
+        ]
+        logger.info(f"[ROUTING]   Pending: {len(pending_tasks)}")
         
         # Get all non-root tasks
         non_root_tasks = [t for t in tasks if t.get('id') != '1']
@@ -360,22 +411,25 @@ class WorkflowBuilder:
         # Otherwise let standard completion check decide
         logger.info("[ROUTING] Calling _check_completion for final decision...")
         completion_result = self.agent._check_completion(state)
-        logger.info(f"[ROUTING] Decision: {completion_result}")
-        logger.info(f"[ROUTING] Decision type: {type(completion_result)}")
-        logger.info("=" * 80)
+        logger.info(f"[ROUTING] _check_completion returned: '{completion_result}'")
+        logger.info(f"[ROUTING] Result type: {type(completion_result)}")
         
         # Ensure we return a valid literal string, not something else
         if completion_result == "continue":
             logger.info("[ROUTING] Returning 'continue' → will route to select_task")
+            logger.info("=" * 80)
             return "continue"
         elif completion_result == "complete":
             logger.info("[ROUTING] Returning 'complete' → will route to END")
+            logger.info("=" * 80)
             return "complete"
         elif completion_result == "max_iterations":
             logger.info("[ROUTING] Returning 'max_iterations' → will route to END")
+            logger.info("=" * 80)
             return "max_iterations"
         else:
-            logger.warning(f"[ROUTING] Unexpected completion result: {completion_result}, defaulting to continue")
+            logger.warning(f"[ROUTING] Unexpected completion result: '{completion_result}', defaulting to continue")
+            logger.info("=" * 80)
             return "continue"
     
     def _route_to_debate_or_completion(self, state: "AgentState") -> Literal["debate", "continue", "complete", "max_iterations"]:

@@ -29,405 +29,241 @@
 - _parse_json_response(response) -> dict
 
 # State Management
-- _post_finding(state, ...) -> state
-- _query_blackboard(state, ...) -> [findings]
-- _record_execution_step(state, ...) -> state
-- _get_blackboard_summary(state) -> dict
-- _get_execution_summary(state) -> dict
-
-# Hierarchy & Deep Decomposition (Phase 1)
-- _post_nested_finding(state, ...) -> state
-- _extract_parent_context(state, parent_id) -> dict
-- _check_depth_limit(state) -> bool
-- _add_context_to_task(state, task_id, context) -> state
-- _establish_hierarchy(state, parent_id, child_ids) -> state
-- _query_blackboard_by_parent(state, parent_id) -> [findings]
-- _query_blackboard_by_depth(state, depth) -> [findings]
-- _get_hierarchy_structure(state) -> dict
-```
-
-**LLM Support**:
-- Anthropic Claude (recommended)
-- OpenAI GPT (all versions)
-- Google Generative AI
-- Local Ollama
-
-### 2. MasterPlanner (task_manager/core/master_planner.py - 550+ lines)
-
-**Purpose**: Sophisticated planning and coordination engine (NEW in Phase 1).
-
-**Key Responsibilities**:
-- Hierarchical task planning with dependency resolution
-- Blackboard pattern for shared knowledge
-- Non-linear execution coordination
-- Execution history tracking
-
-**Key Methods**:
-```python
-# Planning
-- create_initial_plan(objective) -> [PlanNode]
-- _heuristic_create_subplan(task) -> [PlanNode]
-- _llm_create_subplan(task, context) -> [PlanNode]
-
-# Task Navigation
-- get_next_ready_task(plan) -> PlanNode
-- mark_task_complete(plan, task_id) -> [PlanNode]
-- mark_task_failed(plan, task_id, error) -> [PlanNode]
-
-# Blackboard Operations
-- post_finding(blackboard, entry) -> [BlackboardEntry]
-- post_nested_finding(blackboard, ..., parent_id, depth) -> [BlackboardEntry]
-- query_blackboard(blackboard, criteria) -> [BlackboardEntry]
-- query_blackboard_by_parent(blackboard, parent_id) -> [BlackboardEntry]
-- query_blackboard_by_depth(blackboard, depth) -> [BlackboardEntry]
-
-# Hierarchy Management
-- establish_parent_child_relationship(plan, parent_id, child_ids) -> [PlanNode]
-- extract_context_from_parent(plan, parent_id, blackboard) -> dict
-- add_context_to_plan_node(plan, task_id, context) -> [PlanNode]
-- check_depth_limit(current_depth, depth_limit) -> bool
-- get_hierarchy_depth_distribution(plan) -> {depth: count}
-
-# History & Auditing
-- record_step(history, step_name, ...) -> [HistoryEntry]
-- get_execution_summary(history) -> dict
-
-# Routing
-- determine_next_node(task, blackboard, history) -> str
-```
-
-**Data Organization**:
-```python
-class PlanStatus(str, Enum):
-    PENDING = "pending"
-    READY = "ready"
-    EXECUTING = "executing"
-    COMPLETED = "completed"
-    FAILED = "failed"
-
-class BlackboardType(str, Enum):
-    WEB_EVIDENCE = "web_evidence"
-    DATA_POINT = "data_point"
-    TABLE = "table"
-    ANALYSIS = "analysis"
-    HYPOTHESIS = "hypothesis"
-    FINDING = "finding"
-```
-
-### 3. Workflow Builder (task_manager/core/workflow.py - 142 lines)
-
-**Purpose**: LangGraph StateGraph construction and edge definitions.
-
-**Key Components**:
-- Graph node definitions (11 nodes)
-- Conditional edge routing
-- Entry point setup
-- Checkpoint integration
-
-**Graph Structure**:
-```
-initialize
-    ↓
-select_task
-    ↓
-analyze_task
-    ├─→ breakdown_task → select_task (loop)
-    └─→ execute_task
-        ├─→ execute_pdf_task
-        ├─→ execute_excel_task
-        ├─→ execute_ocr_task
-        └─→ execute_web_search_task
-            ↓
-        aggregate_results
-            ↓
-        synthesize_research (conditional)
-            ├─→ trigger if: multiple agents + all tasks complete
-            ├─→ analyzes entire blackboard for contradictions
-            └─→ routes to agentic_debate if contradiction score > 0.7
-            ↓
-        agentic_debate (conditional - NEW v2.3)
-            ├─→ trigger if: synthesis found contradictions with score > 0.7
-            ├─→ spawns Fact-Checker & Lead Researcher personas
-            ├─→ arbiter synthesizes consensus
-            └─→ routes to human_review if deadlock detected
-            ↓
-        check_completion
-            ├─→ More tasks? → select_task (loop)
-            └─→ Done? → human_review (optional) → output
-```
-
-### 4. Synthesis Node (NEW - v2.2)
-
-**Purpose**: Analyze entire blackboard for conflicting data across hierarchy levels and produce comprehensive research brief.
-
 **Triggering Conditions**:
-- ✓ All research tasks have completed (status != PENDING/IN_PROGRESS)
-- ✓ Blackboard contains findings from multiple agents (≥2)
-- ✓ Objective requires detailed analysis
 
-**Key Functionality**:
+## TaskManager Architecture Overview
 
-1. **Blackboard Analysis** - Reviews all entries across hierarchy levels
-2. **Cross-Reference Data** - Compares findings from different sources (WebSearch vs PDF/Excel/OCR)
-3. **Contradiction Detection** - Flags numerical inconsistencies with severity:
-   - **CRITICAL** - Major conflicts that invalidate findings
-   - **HIGH** - Significant discrepancies requiring clarification
-   - **MEDIUM** - Minor inconsistencies worth noting
-   - **LOW** - Trivial differences
-4. **Research Synthesis** - Generates professional research brief with:
-   - Executive summary
-   - Key findings by source
-   - Identified contradictions with context
-   - Confidence level assessment
-5. **Escalation Routing** - Routes to human_review if critical conflicts detected
-
-**Implementation**:
-
-```python
-class SynthesisResult(TypedDict):
-    entry_type: str              # "synthesis_result"
-    source_agent: str            # "synthesis_agent"
-    content: Dict:
-        research_brief: str      # Formatted summary
-        contradictions: List[Dict]:
-            source_a: str
-            source_b: str
-            data_point: str
-            value_a: Any
-            value_b: Any
-            severity: str        # CRITICAL|HIGH|MEDIUM|LOW
-            context: str
-        confidence_level: float  # 0.0-1.0
-        requires_human_review: bool
-    timestamp: str
-    blackboard_entries_analyzed: int
-```
-
-**Routing Logic**:
-- If CRITICAL contradictions found → route to `human_review` with conflict warning
-- If HIGH contradictions found → set `requires_human_review = true`
-- Otherwise → continue to `check_completion`
-
-### 5. Agentic Debate Node (NEW - v2.3)
-
-**Purpose**: Consensus-based validation of conflicting research findings through systematic debate between two distinct LLM personas.
-
-**Triggering Conditions**:
-- ✓ Synthesis node has completed
-- ✓ Contradictions detected with score > 0.7 (severity-weighted)
-- ✓ Multiple conflicting data sources need validation
-
-**Contradiction Score Calculation**:
-```
-score = sum(severity_weights[contradiction.severity] for contradiction in contradictions)
-weights: CRITICAL=0.4, HIGH=0.3, MEDIUM=0.2, LOW=0.1
-threshold: score > 0.7 to trigger debate
-```
-
-**Personas & Debate Strategy**:
-
-1. **Fact-Checker Persona** (Conservative):
-   - Questions assumptions, demands strong evidence, prioritizes data reliability
-   - Scrutinizes sources for methodology flaws, requires high confidence
-
-2. **Lead Researcher Persona** (Inferential):
-   - Considers context, evaluates methodological differences, makes reasoned judgments
-   - Weighs evidence holistically, considers temporal/scope differences
-
-3. **Neutral Arbiter** (Consensus Synthesizer):
-   - Synthesizes both perspectives fairly
-   - Identifies areas of strong consensus vs. genuine disagreement
-   - Final verdict on which data to trust + confidence level
-
-**Output**: Records debate_outcome in blackboard with:
-- Fact-Checker position & confidence
-- Lead Researcher position & confidence
-- Consensus summary + final recommendation
-- Contradiction resolutions (which source to trust for each metric)
-- Determination of whether human review still needed
-
-**Routing After Debate**:
-- If `human_review_still_needed = true` → `human_review`
-- Otherwise → `check_completion`
-
-**Benefits**:
-- ✓ Robust consensus model vs. single point-of-failure
-- ✓ Captures multiple valid interpretations before settling
-- ✓ Audit trail of debate reasoning for transparency
-- ✓ Reduces false escalations to human review
-- ✓ Scales confidence with persona agreement
+This document provides a concise reference for the TaskManager application's design and architecture. It focuses on the system's major components, data flow, and structural relationships.
 
 ---
 
-## Data Models & Structures
+## System Architecture
 
-### AgentState (task_manager/models/state.py)
+### Major Components
 
-**Core State TypedDict** - All execution state flows through this.
-
-```python
-AgentState(TypedDict):
-    # Core Metadata
-    objective: str                          # User's original objective
-    metadata: dict                          # Any metadata
-    iteration_count: int                    # Current iteration number
-    max_iterations: int                     # Safety limit
-    
-    # PHASE 1: Planning & Knowledge
-    plan: Annotated[List[PlanNode], operator.add]              # Hierarchical task plan
-    blackboard: Annotated[List[BlackboardEntry], operator.add] # Shared findings
-    history: Annotated[List[HistoryEntry], operator.add]      # Execution audit trail
-    next_step: str                          # Routing: which node to execute next
-    
-    # Deep Hierarchies (Phase 1.5)
-    current_depth: int                      # Current hierarchy depth (0 = root)
-    depth_limit: int                        # Maximum depth (prevents infinite recursion)
-    parent_context: Optional[Dict[str, Any]] # Context inherited from parent task
-    
-    # Legacy (for backward compatibility)
-    tasks: Annotated[List[Task], operator.add]
-    active_task_id: str
-    completed_task_ids: Annotated[List[str], operator.add]
-    failed_task_ids: Annotated[List[str], operator.add]
-    results: dict
-    requires_human_review: bool
-    human_feedback: str
-```
-
-### PlanNode (Hierarchical Task Definition with Graph Dependencies)
-
-```python
-PlanNode(TypedDict):
-    task_id: str                                    # Unique identifier (e.g., "plan_0")
-    parent_id: Optional[str]                        # Parent task ID (None at root)
-    depth: int                                      # Hierarchical depth (0 = root)
-    description: str                                # Task description
-    status: PlanStatus                              # Current status
-    priority: int                                   # Execution priority
-    
-    # Graph-of-Thought Features (v2.4)
-    dependency_task_ids: List[str]                  # Cross-branch dependencies
-                                                    # Task waits for ALL of these to complete
-                                                    # Example: ["plan_1", "plan_2"]
-                                                    # Default: [] (no dependencies)
-    
-    estimated_effort: str                           # Estimated effort level
-    context_summary: Optional[Dict[str, Any]]       # Key findings from parent
-    child_task_ids: List[str]                       # Direct children for navigation
-    
-    # Backward Compatibility
-    dependencies: List[str]                         # Deprecated: use dependency_task_ids
-```
-
-**Graph-of-Thought Planning Details**:
-
-Unlike traditional tree planning where tasks depend only on their parent:
-- **Tree Model**: Task depends only on parent completing (parent_id)
-  - Pro: Simple, clear hierarchies
-  - Con: No cross-branch dependencies, limited parallelism
-
-- **Graph Model**: Task can depend on multiple OTHER tasks (dependency_task_ids)
-  - Pro: Complex workflows, maximum parallelism, non-linear execution
-  - Con: Requires dependency resolution logic
-
-**Example - Diamond Pattern**:
-```
-plan_0: Root (completed)
-├── plan_1: Search (dependency_task_ids=[])  → Ready immediately
-├── plan_2: PDF Extract (dependency_task_ids=[])  → Ready immediately
-├── plan_3: Excel Process (dependency_task_ids=[])  → Ready immediately
-└── plan_4: Synthesize (dependency_task_ids=["plan_1", "plan_2", "plan_3"])
-    → Waits for ALL three (1, 2, 3) to complete
-
-Status Progression:
-Time 0: plan_1, plan_2, plan_3 ready (run in parallel)
-Time 5: plan_1 done; plan_4 still blocked (needs plan_2 AND plan_3)
-Time 8: plan_2 done; plan_4 still blocked (needs plan_3)
-Time 12: plan_3 done; plan_4 NOW READY → Start
-```
-
-**Dependency Checking Algorithm** (in `get_ready_tasks`):
-1. For each task in PENDING or READY status:
-   - Check if parent exists and is COMPLETED (if parent_id specified)
-   - Check if ALL tasks in dependency_task_ids are COMPLETED
-   - Only mark task as "ready" if both conditions satisfied
-2. Ready tasks are sorted by depth (deep dive first), then priority
-3. Return sorted list for execution
+- **TaskManagerAgent**: Orchestrates workflow, manages state, and coordinates sub-agents.
+- **MasterPlanner**: Handles hierarchical and graph-based task planning, dependency resolution, and blackboard knowledge sharing.
+- **Workflow**: Defines the LangGraph-based execution graph, node transitions, and routing logic.
+- **Sub-Agents**: Specialized agents for PDF, Excel, OCR/Image, Web Search, and Code Interpreter operations.
+- **Blackboard**: Shared knowledge base for findings and results across agents.
+- **History**: Execution audit trail for traceability and debugging.
 
 ---
 
-## Graph-of-Thought Implementation (v2.4)
+## Data Flow & Execution
 
-### Overview
+### High-Level Workflow
 
-Successfully implemented Graph-of-Thought planning system that enables non-linear, multi-dependency task execution in TaskManager. Tasks can now depend on multiple other tasks, enabling complex workflows with parallel execution and diamond dependency patterns.
+1. **Initialization**: TaskManagerAgent is created with user objective and configuration.
+2. **Planning**: MasterPlanner generates a hierarchical/graph-based plan (PlanNode tree) with dependencies.
+3. **Task Selection**: Next ready task is selected based on status and dependencies.
+4. **Analysis/Breakdown**: Tasks are analyzed for further decomposition or direct execution.
+5. **Execution**: Sub-agents perform domain-specific operations (PDF, Excel, OCR, Web, Code).
+6. **Blackboard Update**: Findings/results are posted to the blackboard for knowledge sharing.
+7. **Aggregation/Synthesis**: Results are synthesized, contradictions detected, and consensus reached via agentic debate if needed.
+8. **Final Output**: Comprehensive report and artifacts are generated for user review.
 
-### Key Changes & Enhancement Details
+---
 
-#### 1. **PlanNode Model Enhancement** (`task_manager/models/state.py`)
+## Data Models
 
-**Added**: `dependency_task_ids: NotRequired[List[str]]` field
+### AgentState
 
-- Supports cross-branch dependencies (e.g., Task C depends on A AND B)
-- Backward compatible with existing `dependencies` field
-- Clear separation between parent-child relationships (hierarchy) and cross-branch dependencies (graph)
+Defines the core execution state, including objective, plan, blackboard, history, and routing information.
 
-**Before**:
-```python
-PlanNode(TypedDict):
-    dependencies: List[str]  # Ambiguous - could mean parent or cross-task
+### PlanNode
+
+Represents individual tasks with hierarchical and graph-based dependencies, status, priority, and context.
+
+### BlackboardEntry
+
+Shared findings/knowledge posted by agents, including type, content, source, and relevant task IDs.
+
+### HistoryEntry
+
+Audit trail of execution steps, including timestamps, agent, task, outcome, and errors.
+
+---
+
+## Architecture Diagrams & Data Flow
+
+# TaskManager - Standardized Interface Architecture
+
 ```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                         HUMAN INTERFACE LAYER                                    │
+│  ┌─────────────────────────────────────────────────────────────────────────┐    │
+│  │  HumanInputRequest  ←→  HumanInputResponse                              │    │
+│  │  • Review requests    • Approvals/rejections                            │    │
+│  │  • Clarifications     • Modifications                                   │    │
+│  │  • Decision points    • Human feedback                                  │    │
+│  └─────────────────────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                      ▲
+                                      │ MessageEnvelope
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                           EVENT BUS (Core Orchestration)                         │
+│  ┌─────────────────────────────────────────────────────────────────────────┐    │
+│  │                          SystemEvent Stream                              │    │
+│  │  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐      │    │
+│  │  │ Task Lifecycle   │  │   Data Flow      │  │ Agent Execution   │      │    │
+│  │  │ • task_created   │  │ • ocr_ready      │  │ • agent_started   │      │    │
+│  │  │ • task_started   │  │ • web_findings   │  │ • agent_completed │      │    │
+│  │  │ • task_completed │  │ • file_generated │  │ • chain_triggered │      │    │
+│  │  │ • task_failed    │  │ • data_extracted │  │ • error_occurred  │      │    │
+│  │  └──────────────────┘  └──────────────────┘  └──────────────────┘      │    │
+│  │                                                                          │    │
+│  │  Subscribers:  Master Planner | Synthesis Agent | Monitoring | UI       │    │
+│  └─────────────────────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────────────────┘
+         ▲                        ▲                        ▲
+         │ publish                │ subscribe              │ publish
+         │                        │                        │
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                          AGENT EXECUTION LAYER                                   │
+│  ┌─────────────────────────────────────────────────────────────────────────┐    │
+│  │  AgentExecutionRequest  →  [Agent Logic]  →  AgentExecutionResponse     │    │
+│  │                                                                          │    │
+│  │  Input Format:              Processing:         Output Format:          │    │
+│  │  • task_id                  • Execute           • status (success/fail) │    │
+│  │  • operation                • Process           • result (data)         │    │
+│  │  • parameters               • Transform         • artifacts (files)     │    │
+│  │  • input_data               • Validate          • blackboard_entries    │    │
+│  │  • blackboard context       • Cache             • next_agents (chain)   │    │
+│  │  • temp/output folders      • Error handling    • event_triggers        │    │
+│  │  • timeout/retries          • Monitoring        • confidence_score      │    │
+│  │                                                                          │    │
+│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐      │    │
+│  │  │   PDF    │ │  Excel   │ │   OCR    │ │   Web    │ │   Code   │      │    │
+│  │  │  Agent   │ │  Agent   │ │  Agent   │ │  Search  │ │Interpreter│     │    │
+│  │  └──────────┘ └──────────┘ └──────────┘ └──────────┘ └──────────┘      │    │
+│  └─────────────────────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────────────────┘
+         │                                                            │
+         │ chain_data (cross-agent workflows)                        │
+         ▼                                                            ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                           STORAGE LAYER                                          │
+│  ┌─────────────────────────────────────────────────────────────────────────┐    │
+│  │  In-Memory State (LangGraph)          TempDataSchema                    │    │
+│  │  ┌───────────────────────────┐        ┌─────────────────────────┐       │    │
+│  │  │ AgentState:               │        │ • schema_version        │       │    │
+│  │  │ • objective               │        │ • data_type             │       │    │
+│  │  │ • tasks (list)            │        │ • key, task_id          │       │    │
+│  │  │ • plan (list)             │        │ • session_id            │       │    │
+│  │  │ • blackboard (list)       │        │ • data (payload)        │       │    │
+│  │  │ • history (list)          │        │ • ttl_hours, expires_at │       │    │
+│  │  │ • event_queue (NEW)       │        │ • source_agent          │       │    │
+│  │  │ • message_inbox (NEW)     │        │ • provenance tracking   │       │    │
+│  │  └───────────────────────────┘        └─────────────────────────┘       │    │
+│  │                                                                          │    │
+│  │  CacheEntrySchema (Redis)             LLMRequest/Response               │    │
+│  │  ┌───────────────────────────┐        ┌─────────────────────────┐       │    │
+│  │  │ • namespace, key          │        │ Request:                │       │    │
+│  │  │ • cached_at, ttl_seconds  │        │ • provider, model       │       │    │
+│  │  │ • hit_count               │        │ • system/user prompts   │       │    │
+│  │  │ • input_hash (SHA-256)    │        │ • temperature, tokens   │       │    │
+│  │  │ • output_data             │        │ • response_format       │       │    │
+│  │  │ • agent_name, operation   │        │                         │       │    │
+│  │  │ • execution_time_ms       │        │ Response:               │       │    │
+│  │  │ • provenance tracking     │        │ • content (text/json)   │       │    │
+│  │  └───────────────────────────┘        │ • tokens used, cost     │       │    │
+│  │                                        │ • latency, confidence   │       │    │
+│  │                                        └─────────────────────────┘       │    │
+│  └─────────────────────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                         ERROR HANDLING LAYER                                     │
+│  ┌─────────────────────────────────────────────────────────────────────────┐    │
+│  │  ErrorResponse                                                           │    │
+│  │  ┌──────────────────────────────────────────────────────────────┐        │    │
+│  │  │ • error_id, timestamp                                        │        │    │
+│  │  │ • error_code (e.g., WEB_SEARCH_TIMEOUT_001)                 │        │    │
+│  │  │ • error_type (validation, execution, timeout, resource)     │        │    │
+│  │  │ • severity (low, medium, high, critical)                    │        │    │
+│  │  │ • message (human-readable)                                  │        │    │
+│  │  │ • details (technical info)                                  │        │    │
+│  │  │ • source, task_id, operation                                │        │    │
+│  │  │ • stack_trace                                               │        │    │
+│  │  │ • recoverable (bool)                                        │        │    │
+│  │  │ • recovery_suggestions (list)                               │        │    │
+│  │  │ • retry_after_seconds                                       │        │    │
+│  │  └──────────────────────────────────────────────────────────────┘        │    │
+│  │                                                                          │    │
+│  │  Dead Letter Queue:  Failed events waiting for manual intervention      │    │
+│  └─────────────────────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────────────────┘
 
-**After**:
-```python
-PlanNode(TypedDict):
-    dependency_task_ids: List[str]  # Explicit: cross-branch dependencies
-    dependencies: Optional[List[str]]  # Deprecated, kept for compatibility
-```
 
-#### 2. **MasterPlanner Dependency Checking** (`task_manager/core/master_planner.py`)
+════════════════════════════════════════════════════════════════════════════════
+                              MESSAGE FLOW EXAMPLE
+════════════════════════════════════════════════════════════════════════════════
 
-**Updated**: `get_ready_tasks()` method with full dependency resolution
+1. TASK CREATION:
+   Master Planner → AgentExecutionRequest → Web Search Agent
+   {
+     "task_id": "task_1.2.3",
+     "operation": "search",
+     "parameters": {"query": "Karnataka districts"},
+     "temp_folder": "/temp",
+     "cache_enabled": true
+   }
 
-**Logic**:
-1. Task status must be PENDING or READY (not BLOCKED, EXECUTING, FAILED)
-2. IF parent exists: parent must be COMPLETED
-3. ALL tasks in `dependency_task_ids` must be COMPLETED
-4. Only then is task marked as "ready" for execution
+2. AGENT EXECUTION:
+   Web Search Agent processes request → generates CSV
 
-**Implementation**:
-```python
-# Build task map for quick lookup
-task_map = {t.get('task_id'): t for t in plan}
+3. RESPONSE:
+   Web Search Agent → AgentExecutionResponse → Master Planner
+   {
+     "status": "success",
+     "result": {"districts": [...]},
+     "artifacts": [{"type": "csv", "path": "output.csv"}],
+     "next_agents": ["excel_agent"],
+     "event_triggers": ["web_findings_ready"]
+   }
 
-# Check parent completion
-if parent_id:
-    parent_task = task_map.get(parent_id)
-    if not parent_task or parent_task.get('status') != COMPLETED:
-        continue  # Skip - parent not done
+4. EVENT PUBLICATION:
+   Web Search Agent → SystemEvent → Event Bus
+   {
+     "event_type": "web_findings_ready",
+     "event_category": "data_flow",
+     "source_agent": "web_search_agent",
+     "payload": {"csv_file": "output.csv"},
+     "listeners": ["excel_agent", "synthesis_agent"]
+   }
 
-# Check graph dependencies
-dependency_ids = task.get('dependency_task_ids', [])
-if dependency_ids:
-    all_deps_done = all(
-        task_map.get(dep_id).get('status') == COMPLETED
-        for dep_id in dependency_ids
-    )
-    if not all_deps_done:
-        continue  # Skip - dependencies not done
-```
+5. EVENT PROPAGATION:
+   Event Bus → notifies subscribers:
+   - Excel Agent: Receives event, processes CSV
+   - Synthesis Agent: Receives event, analyzes findings
+   - Monitoring Service: Logs event
 
-#### 3. **Planning Prompt Enhancement** (in `_llm_create_subplan()`)
+6. CHAIN EXECUTION:
+   Excel Agent automatically executes using chain_data from Web Search response
+   No need to go through task selection again
 
-**Enhanced**: LLM planning prompt to explicitly request dependency mapping
+7. ERROR HANDLING (if failure):
+   Agent → ErrorResponse → Event Bus → Dead Letter Queue (if max retries exceeded)
 
-**New Instructions**:
-```python
-prompt = """
-Graph-of-Thought Planning:
-- Each task can depend on multiple OTHER tasks (not just parent)
-- Use dependency_task_ids to create non-linear workflows
-- Example: plan_1 (search), plan_2 (extract), plan_3 (synthesis depends on both plan_1 and plan_2)
+════════════════════════════════════════════════════════════════════════════════
+                           KEY DESIGN PRINCIPLES
+════════════════════════════════════════════════════════════════════════════════
+
+✓ TYPE SAFETY:        All schemas use TypedDict for IDE support & validation
+✓ CONSISTENCY:        Same format across all agents and components
+✓ TRACEABILITY:       correlation_id links requests → responses → events
+✓ EVENT-DRIVEN:       Reactive architecture via pub-sub EventBus
+✓ DECOUPLING:         Agents don't need direct references to each other
+✓ VERSIONING:         schema_version field in all storage formats
+✓ OBSERVABILITY:      Complete audit trail via event history
+✓ RESILIENCE:         Dead letter queue, retry logic, error recovery
+✓ EXTENSIBILITY:      Easy to add new agents, events, storage types
+✓ INTEROPERABILITY:   JSON-compatible schemas work across languages
+
+════════════════════════════════════════════════════════════════════════════════
 
 Return JSON with:
 {
@@ -3291,4 +3127,278 @@ pip install task-manager-agent[observability]
 ---
 
 **TaskManager v2.5** | Comprehensive Logging & Observability | Production Ready ✅ | January 26, 2026
+
+---
+
+# Redis Cache Manager - Quick Reference
+
+INSTALLATION:
+    pip install redis
+    redis-server  # Start Redis locally
+
+BASIC USAGE:
+    from task_manager.utils import RedisCacheManager
+    
+    cache = RedisCacheManager()  # Connects to localhost:6379
+    
+    # Cache a result
+    cache.cache_task_result(
+        task_id="task_1.2",
+        input_data={"query": "search term"},
+        output_data={"results": [...]},
+        agent_type="web_search_agent"
+    )
+    
+    # Retrieve cached result
+    cached = cache.get_cached_result("task_1.2")
+    if cached:
+        print(cached['output'])  # {"results": [...]}
+
+DATA STRUCTURE:
+    Key: task:{task_id}
+    Type: Redis Hash
+    Fields:
+        - input: JSON string of input parameters
+        - output: JSON string of execution results
+        - timestamp: ISO format creation time
+        - agent_type: Agent that created this result
+    TTL: 86400 seconds (24 hours)
+
+API METHODS:
+    cache_task_result(task_id, input_data, output_data, agent_type=None, ttl=None)
+        → Returns: bool (True if cached successfully)
+    
+    get_cached_result(task_id)
+        → Returns: dict with keys [input, output, timestamp, agent_type, ttl]
+        → Returns: None if not found or Redis unavailable
+    
+    invalidate_cache(task_id)
+        → Returns: bool (True if deleted)
+    
+    get_all_cached_tasks(pattern="task:*")
+        → Returns: list[str] of task IDs
+    
+    clear_all_cache(pattern="task:*")
+        → Returns: int (number of keys deleted)
+
+CONFIGURATION:
+    cache = RedisCacheManager(
+        host='localhost',      # Redis host
+        port=6379,            # Redis port
+        db=0,                 # Database number (0-15)
+        password=None,        # Auth password
+        default_ttl=86400     # Default TTL in seconds
+    )
+
+CONTEXT MANAGER:
+    with RedisCacheManager() as cache:
+        cache.cache_task_result(...)
+    # Connection auto-closed
+
+REDIS CLI COMMANDS:
+    # View all cached tasks
+    redis-cli KEYS "task:*"
+    
+    # View specific task
+    redis-cli HGETALL "task:task_1.2"
+    
+    # Check TTL
+    redis-cli TTL "task:task_1.2"
+    
+    # Delete specific task
+    redis-cli DEL "task:task_1.2"
+    
+    # Delete all tasks
+    redis-cli --scan --pattern "task:*" | xargs redis-cli DEL
+
+GRACEFUL DEGRADATION:
+    # If Redis is unavailable, cache operations fail silently:
+    cache = RedisCacheManager(host='nonexistent')
+    cache.cache_task_result(...)  # Returns False, doesn't crash
+    cached = cache.get_cached_result(...)  # Returns None
+
+ERROR HANDLING:
+    try:
+        cache.cache_task_result(...)
+    except Exception as e:
+        # Should not raise - all errors handled internally
+        pass
+
+INTEGRATION EXAMPLE:
+    class TaskManagerAgent:
+        def __init__(self):
+            self.cache = RedisCacheManager()
+        
+        def _execute_web_search_task(self, state):
+            task_id = state['active_task_id']
+            
+            # Check cache
+            cached = self.cache.get_cached_result(task_id)
+            if cached:
+                return self._build_cached_response(state, cached)
+            
+            # Execute task
+            result = self.web_search_agent.search(...)
+            
+            # Cache result
+            self.cache.cache_task_result(
+                task_id=task_id,
+                input_data=task['parameters'],
+                output_data=result,
+                agent_type='web_search_agent'
+            )
+            
+            return self._build_response(state, result)
+
+DOCKER DEPLOYMENT:
+    docker run -d -p 6379:6379 --name redis-cache redis:7-alpine
+
+MONITORING:
+    # Cache hit rate
+    redis-cli INFO stats | grep keyspace_hits
+    
+    # Memory usage
+    redis-cli INFO memory | grep used_memory_human
+    
+    # Connected clients
+    redis-cli INFO clients
+
+TTL EXAMPLES:
+    # 1 hour
+    cache.cache_task_result(..., ttl=3600)
+    
+    # 1 week
+    cache.cache_task_result(..., ttl=604800)
+    
+    # No expiration (not recommended)
+    cache.cache_task_result(..., ttl=-1)
+
+BEST PRACTICES:
+    ✓ Cache expensive operations (web search, OCR, LLM calls)
+    ✓ Use descriptive task_ids
+    ✓ Set appropriate TTLs based on data freshness needs
+    ✓ Monitor cache hit rates
+    ✓ Use context managers for automatic cleanup
+    ✗ Don't cache failed task results
+    ✗ Don't use cache for real-time data
+    ✗ Don't store sensitive data without encryption
+
+---
+
+# Problem Solver Agent Enhancement
+
+## Overview
+
+A new `ProblemSolverAgent` sub-agent has been created to provide intelligent error resolution and human input interpretation capabilities to the Task Manager system.
+
+## Features
+
+### 1. Error Diagnosis and Analysis
+When a task fails, the `ProblemSolverAgent` automatically:
+- Analyzes the error message to identify the error category
+- Matches against known error patterns (file_not_found, permission_denied, sheet_not_found, etc.)
+- Generates solution prompts based on the error type
+
+### 2. LLM-Based Solution Generation
+For each error, the agent can:
+- Request an LLM to generate structured solutions
+- Provide solution types: `retry`, `modify_params`, `skip`, `manual_input`, `alternative_approach`
+- Include confidence scores and alternative approaches
+- Suggest whether human input is required
+
+### 3. Human Input Interpretation
+When users provide natural language input during human review, the agent:
+- Parses the input into structured data
+- Formats it appropriately for the target agent (Excel, PDF, Web Search, etc.)
+- Supports multiple output formats (JSON, dict, excel_params, etc.)
+
+### 4. Agent-Specific Formatting
+The agent can format data for consumption by:
+- Excel Agent
+- PDF Agent
+- Web Search Agent
+- OCR Agent
+- Code Interpreter Agent
+
+## Integration with Main Agent
+
+### Error Handling Flow
+```
+Task Fails → _handle_error() → ProblemSolverAgent.diagnose_error() 
+           → ProblemSolverAgent.get_solution() → Enhanced error info stored
+           → Route to human_review if needed
+```
+
+### Human Review Flow
+```
+Human provides input → ProblemSolverAgent.interpret_human_input()
+                    → ProblemSolverAgent.format_for_agent()
+                    → Structured data used for task retry
+```
+
+## Human Review Display
+
+When a task fails and enters human review, the system now displays:
+
+```
+======================================================================
+FAILED TASK - HUMAN REVIEW REQUIRED
+======================================================================
+
+Task ID: task_123
+Task: Create Excel file with data
+
+❌ FAILURE REASON: Sheet not found
+
+🤖 AI ERROR DIAGNOSIS:
+   Category: sheet_not_found
+   Solution Hint: The Excel sheet was not found. Suggest sheet name alternatives...
+
+💡 SUGGESTED SOLUTION:
+   Type: modify_params
+   Action: Verify the sheet name exists or create a new sheet...
+   Confidence: 0.85
+   Alternatives:
+     1. Create the sheet first before writing...
+     2. Use a different sheet name from available sheets...
+
+Options for Failed Task:
+  1. Restart task with updated context/input
+  2. Provide manual output (use your input as task result)
+  3. Ignore and continue (mark as skipped)
+  4. Abort workflow
+```
+
+## Key Classes and Methods
+
+### ProblemSolverAgent
+
+```python
+class ProblemSolverAgent:
+    def diagnose_error(error_message, task_context, agent_type) -> Dict
+    def get_solution(error_message, task_context, agent_type, available_data) -> Dict
+    def interpret_human_input(human_input, target_format, task_context, expected_fields) -> Dict
+    def format_for_agent(data, agent_type, operation) -> Dict
+    def generate_retry_parameters(failed_task, error_info, human_input) -> Dict
+    def create_task_output_from_human_input(human_input, task_context, expected_format) -> Dict
+```
+
+## Files Modified
+
+1. **task_manager/sub_agents/problem_solver_agent.py** - New file (1000+ lines)
+2. **task_manager/sub_agents/__init__.py** - Added ProblemSolverAgent export
+3. **task_manager/core/agent.py** - Integrated ProblemSolverAgent:
+   - Added import and initialization
+   - Enhanced `_handle_error()` with error diagnosis and solution generation
+   - Enhanced `_request_human_review()` with AI input interpretation
+   - Updated display to show error analysis and solutions
+
+## Usage Example
+
+The ProblemSolverAgent is automatically used when:
+1. A task fails during execution
+2. A user provides input during human review
+
+No manual intervention is required - the integration is transparent.
+
 

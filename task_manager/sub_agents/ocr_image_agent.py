@@ -7,6 +7,12 @@ Capabilities:
 - Process screenshots and scanned documents
 - Recognize text in multiple languages
 - Extract structured data from forms and tables in images
+
+Migration Status: Week 7 Day 1 - Dual Format Support
+- Renamed run_operation → execute_task
+- Supports both legacy dict and standardized AgentExecutionRequest/Response
+- Maintains 100% backward compatibility
+- Publishes SystemEvent on completion for event-driven workflows
 """
 
 from typing import Optional, List, Dict, Any, Union
@@ -15,8 +21,27 @@ from datetime import datetime
 import json
 import base64
 import numpy as np
+import time
 
 from task_manager.utils.logger import get_logger
+
+# Import standardized schemas and utilities (Week 1-2 implementation)
+from task_manager.models import (
+    AgentExecutionRequest,
+    AgentExecutionResponse,
+    create_system_event,
+    create_error_response
+)
+from task_manager.utils import (
+    auto_convert_response,
+    validate_agent_execution_response,
+    exception_to_error_response,
+    InvalidParameterError,
+    OCRError,
+    MissingDependencyError,
+    wrap_exception
+)
+from task_manager.core.event_bus import get_event_bus
 
 logger = get_logger(__name__)
 
@@ -35,11 +60,12 @@ class OCRImageAgent:
     
     def __init__(self, llm=None):
         """
-        Initialize OCR and Image Agent.
+        Initialize OCR and Image Agent with dual-format support.
         
         Args:
             llm: Optional LLM instance for vision analysis (e.g., Claude, GPT-4o, Gemini)
         """
+        self.agent_name = "ocr_image_agent"
         self.supported_operations = [
             "ocr_image",
             "extract_images_from_pdf",
@@ -51,7 +77,11 @@ class OCRImageAgent:
             "analyze_visual_content"  # NEW: Multimodal vision analysis
         ]
         self.llm = llm
-        logger.info("OCR and Image Agent initialized")
+        
+        # Initialize event bus for event-driven workflows
+        self.event_bus = get_event_bus()
+        
+        logger.info("OCR and Image Agent initialized with dual-format support")
         self._check_dependencies()
         self._initialize_vision_capabilities()
     
@@ -1115,13 +1145,189 @@ class OCRImageAgent:
         
         return ocr_result
     
+    def execute_task(
+        self,
+        *args: Any,
+        **kwargs: Any
+    ) -> Union[Dict[str, Any], AgentExecutionResponse]:
+        """
+        Execute an OCR/Image operation with dual-format support.
+        
+        Supports three calling conventions:
+        1. Legacy positional: execute_task(operation, parameters)
+        2. Legacy dict: execute_task({'operation': ..., 'parameters': ...})
+        3. Standardized: execute_task(AgentExecutionRequest)
+        
+        Args:
+            *args: Variable positional arguments
+            **kwargs: Variable keyword arguments
+        
+        Returns:
+            Legacy dict OR AgentExecutionResponse based on input format
+        """
+        start_time = time.time()
+        return_legacy = True
+        operation = None
+        parameters = None
+        task_dict = None
+        
+        # Detect calling convention
+        # Positional arguments (operation, parameters)
+        if len(args) == 2:
+            operation, parameters = args
+            task_dict = {"operation": operation, "parameters": parameters}
+            return_legacy = True
+            logger.debug("Legacy positional call")
+        
+        # Single dict argument
+        elif len(args) == 1 and isinstance(args[0], dict):
+            task_dict = args[0]
+            # Check if standardized request (has task_id and task_description)
+            if "task_id" in task_dict and "task_description" in task_dict:
+                return_legacy = False
+                logger.debug(f"Standardized request call: task_id={task_dict.get('task_id')}")
+            else:
+                return_legacy = True
+                logger.debug("Legacy dict call")
+            operation = task_dict.get("operation")
+            parameters = task_dict.get("parameters", {})
+        
+        # Keyword arguments (operation=..., parameters=...)
+        elif "operation" in kwargs:
+            operation = kwargs.get("operation")
+            parameters = kwargs.get("parameters", {})
+            task_dict = {"operation": operation, "parameters": parameters}
+            return_legacy = True
+            logger.debug("Legacy keyword call")
+        
+        else:
+            raise InvalidParameterError(
+                parameter_name="task",
+                message="Invalid call to execute_task. Use one of:\n"
+                "  - execute_task(operation, parameters)\n"
+                "  - execute_task({'operation': ..., 'parameters': ...})\n"
+                "  - execute_task(AgentExecutionRequest)"
+            )
+        
+        try:
+            task_id = task_dict.get("task_id", f"ocr_{int(time.time())}")  # type: ignore
+            
+            # Ensure parameters is not None
+            if parameters is None:
+                parameters = {}
+            
+            # Ensure operation is not None
+            if operation is None:
+                operation = "unknown"
+            
+            logger.info(f"Executing OCR/Image operation: {operation} (task_id={task_id})")
+            
+            # Execute the operation using existing methods
+            if operation == "ocr_image":
+                result = self.ocr_image(
+                    image_path=parameters.get('image_path', ''),
+                    language=parameters.get('language', 'eng'),
+                    engine=parameters.get('engine'),
+                    preprocessing=parameters.get('preprocessing', True)
+                )
+            
+            elif operation == "extract_images_from_pdf":
+                result = self.extract_images_from_pdf(
+                    pdf_path=parameters.get('pdf_path', ''),
+                    output_dir=parameters.get('output_dir', ''),
+                    page_range=parameters.get('page_range'),
+                    dpi=parameters.get('dpi', 300)
+                )
+            
+            elif operation == "batch_ocr":
+                result = self.batch_ocr(
+                    image_paths=parameters.get('image_paths', []),
+                    language=parameters.get('language', 'eng'),
+                    engine=parameters.get('engine')
+                )
+            
+            elif operation == "process_screenshot":
+                # Alias for ocr_image
+                result = self.ocr_image(
+                    image_path=parameters.get('image_path', ''),
+                    language=parameters.get('language', 'eng'),
+                    engine=parameters.get('engine'),
+                    preprocessing=parameters.get('preprocessing', True)
+                )
+            
+            elif operation == "analyze_visual_content":
+                result = self.analyze_visual_content(
+                    image_path=parameters.get('image_path', ''),
+                    analysis_prompt=parameters.get('analysis_prompt'),
+                    auto_detect=parameters.get('auto_detect', True)
+                )
+            
+            else:
+                result = {
+                    "success": False,
+                    "error": f"Unknown operation: {operation}",
+                    "supported_operations": self.supported_operations
+                }
+            
+            # Convert legacy result to standardized response
+            standard_response = self._convert_to_standard_response(
+                result,
+                operation,
+                task_id,
+                start_time
+            )
+            
+            # Publish completion event for event-driven workflows
+            self._publish_completion_event(task_id, operation, standard_response)
+            
+            # Return in requested format
+            if return_legacy:
+                # Convert back to legacy format for backward compatibility
+                return self._convert_to_legacy_response(standard_response)
+            else:
+                return standard_response
+        
+        except Exception as e:
+            logger.error(f"Error executing OCR/Image task: {e}", exc_info=True)
+            
+            # Create standardized error response
+            error = exception_to_error_response(
+                e,
+                source=self.agent_name,
+                task_id=task_dict.get("task_id", "unknown") if task_dict else "unknown"
+            )
+            
+            error_response: AgentExecutionResponse = {
+                "status": "failure",
+                "success": False,
+                "result": {},
+                "artifacts": [],
+                "execution_time_ms": int((time.time() - start_time) * 1000),
+                "timestamp": datetime.now().isoformat(),
+                "agent_name": self.agent_name,
+                "operation": operation or "unknown",
+                "blackboard_entries": [],
+                "warnings": []
+            }
+            # Add error field separately to handle TypedDict
+            error_response["error"] = error  # type: ignore
+            
+            if return_legacy:
+                return self._convert_to_legacy_response(error_response)
+            else:
+                return error_response
+    
+    # Backward compatibility: keep run_operation as alias
     def run_operation(
         self,
         operation: str,
         parameters: Dict[str, Any]
     ) -> Dict[str, Any]:
         """
-        Execute an OCR/Image operation based on operation type.
+        Execute an OCR/Image operation (backward compatibility wrapper).
+        
+        DEPRECATED: Use execute_task() instead.
+        This method is maintained for backward compatibility only.
         
         Args:
             operation: Type of operation
@@ -1130,53 +1336,154 @@ class OCRImageAgent:
         Returns:
             Result dictionary
         """
-        logger.info(f"Executing OCR/Image operation: {operation}")
+        logger.debug("run_operation() called - forwarding to execute_task()")
+        return self.execute_task(operation, parameters)  # type: ignore
+    
+    def _convert_to_standard_response(
+        self,
+        legacy_result: Dict[str, Any],
+        operation: str,
+        task_id: str,
+        start_time: float
+    ) -> AgentExecutionResponse:
+        """Convert legacy result dict to standardized AgentExecutionResponse."""
+        success = legacy_result.get("success", False)
         
-        if operation == "ocr_image":
-            return self.ocr_image(
-                image_path=parameters.get('image_path', ''),
-                language=parameters.get('language', 'eng'),
-                engine=parameters.get('engine'),
-                preprocessing=parameters.get('preprocessing', True)
+        # Extract artifacts from result
+        artifacts = []
+        
+        # Handle image output files
+        if "output_images" in legacy_result and success:
+            for img_path in legacy_result.get("output_images", []):
+                if Path(img_path).exists():
+                    artifacts.append({
+                        "type": "image",
+                        "path": str(img_path),
+                        "size_bytes": Path(img_path).stat().st_size,
+                        "description": f"Extracted image from {operation} operation"
+                    })
+        
+        # Handle text output files
+        if "output_file" in legacy_result and success:
+            output_file = legacy_result["output_file"]
+            if Path(output_file).exists():
+                artifacts.append({
+                    "type": "txt",
+                    "path": str(output_file),
+                    "size_bytes": Path(output_file).stat().st_size,
+                    "description": f"OCR text output from {operation} operation"
+                })
+        
+        # Create blackboard entries for sharing data
+        blackboard_entries = []
+        if success and "text" in legacy_result:
+            blackboard_entries.append({
+                "key": f"ocr_text_{task_id}",
+                "value": legacy_result.get("text", ""),
+                "scope": "workflow",
+                "ttl_seconds": 3600
+            })
+        
+        if success and "table_data" in legacy_result:
+            blackboard_entries.append({
+                "key": f"table_data_{task_id}",
+                "value": legacy_result.get("table_data", []),
+                "scope": "workflow",
+                "ttl_seconds": 3600
+            })
+        
+        # Build standardized response
+        response: AgentExecutionResponse = {
+            "status": "success" if success else "failure",
+            "success": success,
+            "result": {
+                k: v for k, v in legacy_result.items()
+                if k not in ["success", "output_images", "output_file"]
+            },
+            "artifacts": artifacts,
+            "execution_time_ms": int((time.time() - start_time) * 1000),
+            "timestamp": datetime.now().isoformat(),
+            "agent_name": self.agent_name,
+            "operation": operation,
+            "blackboard_entries": blackboard_entries,
+            "warnings": []
+        }
+        
+        # Add error field if present (handle TypedDict)
+        if not success and "error" in legacy_result:
+            response["error"] = create_error_response(  # type: ignore
+                error_code="OCR_001",
+                error_type="execution_error",
+                message=legacy_result.get("error", "Unknown error"),
+                source=self.agent_name
             )
         
-        elif operation == "extract_images_from_pdf":
-            return self.extract_images_from_pdf(
-                pdf_path=parameters.get('pdf_path', ''),
-                output_dir=parameters.get('output_dir', ''),
-                page_range=parameters.get('page_range'),
-                dpi=parameters.get('dpi', 300)
-            )
+        return response
+    
+    def _convert_to_legacy_response(self, standard_response: AgentExecutionResponse) -> Dict[str, Any]:
+        """Convert standardized response back to legacy format for backward compatibility."""
+        legacy: Dict[str, Any] = {
+            "success": standard_response["success"],
+        }
         
-        elif operation == "batch_ocr":
-            return self.batch_ocr(
-                image_paths=parameters.get('image_paths', []),
-                language=parameters.get('language', 'eng'),
-                engine=parameters.get('engine')
-            )
+        # Add output_images from artifacts
+        image_artifacts = [a for a in standard_response["artifacts"] if a["type"] == "image"]
+        if image_artifacts:
+            legacy["output_images"] = [a["path"] for a in image_artifacts]
         
-        elif operation == "process_screenshot":
-            # Alias for ocr_image
-            return self.ocr_image(
-                image_path=parameters.get('image_path', ''),
-                language=parameters.get('language', 'eng'),
-                engine=parameters.get('engine'),
-                preprocessing=parameters.get('preprocessing', True)
-            )
+        # Add output_file from artifacts
+        text_artifacts = [a for a in standard_response["artifacts"] if a["type"] == "txt"]
+        if text_artifacts:
+            legacy["output_file"] = text_artifacts[0]["path"]
         
-        elif operation == "analyze_visual_content":
-            return self.analyze_visual_content(
-                image_path=parameters.get('image_path', ''),
-                analysis_prompt=parameters.get('analysis_prompt'),
-                auto_detect=parameters.get('auto_detect', True)
-            )
+        # Add error if present (use .get() for NotRequired field)
+        error = standard_response.get("error")  # type: ignore
+        if error:
+            legacy["error"] = error["message"]  # type: ignore
         
-        else:
-            return {
-                "success": False,
-                "error": f"Unknown operation: {operation}",
-                "supported_operations": self.supported_operations
-            }
+        # Merge result fields into top level (legacy pattern)
+        if isinstance(standard_response["result"], dict):
+            for key, value in standard_response["result"].items():
+                if key not in legacy:
+                    legacy[key] = value
+        
+        return legacy
+    
+    def _publish_completion_event(
+        self,
+        task_id: str,
+        operation: str,
+        response: AgentExecutionResponse
+    ):
+        """Publish task completion event for event-driven workflows."""
+        try:
+            # Choose event type based on operation
+            if operation == "ocr_image" or operation == "process_screenshot":
+                event_type = "ocr_extraction_completed"
+            elif "table" in operation:
+                event_type = "table_data_ready"
+            elif "extract_images" in operation:
+                event_type = "images_extracted"
+            else:
+                event_type = "ocr_operation_completed"
+            
+            event = create_system_event(
+                event_type=event_type,
+                event_category="task_lifecycle",
+                source_agent=self.agent_name,
+                payload={
+                    "task_id": task_id,
+                    "operation": operation,
+                    "success": response["success"],
+                    "artifacts": response["artifacts"],
+                    "blackboard_keys": [entry["key"] for entry in response["blackboard_entries"]]
+                }
+            )
+            self.event_bus.publish(event)
+            logger.debug(f"Published completion event for task {task_id}")
+        except Exception as e:
+            logger.warning(f"Failed to publish completion event: {e}")
+
 
 class VisionLLMWrapper:
     """

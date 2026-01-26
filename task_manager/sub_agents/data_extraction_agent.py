@@ -2,6 +2,8 @@
 Data Extraction Sub-Agent for analyzing and extracting relevant information
 from input and temp folder data.
 
+Migration Status: Week 7 Day 3 - Dual Format Support
+
 This agent intelligently extracts only the relevant portions of input data
 based on the current task objective, avoiding large context overhead.
 
@@ -11,6 +13,11 @@ Capabilities:
 - Filter and extract specific data based on queries
 - Cache extracted data for reuse within a session
 - Prioritize and rank input files by relevance to task
+
+Operations:
+- extract_relevant_data: Extract relevant data from folders
+- get_file_preview: Quick preview of a single file
+- search_in_files: Search for content across files
 """
 
 from typing import Optional, List, Dict, Any, Union, Tuple
@@ -19,7 +26,25 @@ from datetime import datetime
 import json
 import re
 import hashlib
+import time
 from dataclasses import dataclass, field
+
+# Import standardized schemas and utilities (Week 1-2 implementation)
+from task_manager.models import (
+    AgentExecutionRequest,
+    AgentExecutionResponse,
+    create_system_event,
+    create_error_response
+)
+from task_manager.utils import (
+    auto_convert_response,
+    validate_agent_execution_response,
+    exception_to_error_response,
+    InvalidParameterError,
+    DataExtractionError,
+    wrap_exception
+)
+from task_manager.core.event_bus import get_event_bus
 
 from task_manager.utils.logger import get_logger
 
@@ -103,29 +128,30 @@ class DataExtractionAgent:
         cache_extractions: bool = True
     ):
         """
-        Initialize Data Extraction Agent.
+        Initialize Data Extraction Agent with dual-format support.
         
         Args:
             llm_client: LLM client for intelligent summarization
             cache_extractions: Whether to cache extraction results
         """
+        self.agent_name = "data_extraction_agent"
         self.llm_client = llm_client
         self.cache_extractions = cache_extractions
         self._extraction_cache: Dict[str, ExtractionResult] = {}
         self._session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         
+        # Initialize event bus for event-driven workflows
+        self.event_bus = get_event_bus()
+        
         self.supported_operations = [
-            "extract_relevant",
-            "summarize_file",
-            "search_content",
-            "rank_by_relevance",
-            "extract_structured",
-            "get_file_preview"
+            "extract_relevant_data",
+            "get_file_preview",
+            "search_in_files"
         ]
         
         # Check for optional dependencies
         self._check_dependencies()
-        logger.info("Data Extraction Agent initialized")
+        logger.info(f"Data Extraction Agent initialized with dual-format support")
     
     def _check_dependencies(self):
         """Check for optional dependencies."""
@@ -154,6 +180,297 @@ class DataExtractionAgent:
             self.has_docx = True
         except ImportError:
             logger.debug("DOCX support not available")
+    
+    def execute_task(
+        self,
+        *args: Any,
+        **kwargs: Any
+    ) -> Union[Dict[str, Any], AgentExecutionResponse]:
+        """
+        Execute a data extraction operation with dual-format support.
+        
+        Supports three calling conventions:
+        1. Legacy positional: execute_task(operation, parameters)
+        2. Legacy dict: execute_task({'operation': ..., 'parameters': ...})
+        3. Standardized: execute_task(AgentExecutionRequest)
+        
+        Operations:
+        - extract_relevant_data: Extract relevant data from input folders
+        - get_file_preview: Get quick preview of a single file
+        - search_in_files: Search for specific content across files
+        
+        Args:
+            *args: Variable positional arguments
+            **kwargs: Variable keyword arguments
+        
+        Returns:
+            Legacy dict OR AgentExecutionResponse based on input format
+        """
+        start_time = time.time()
+        return_legacy = True
+        operation = None
+        parameters = None
+        task_dict = None
+        
+        # Detect calling convention
+        # Positional arguments (operation, parameters)
+        if len(args) == 2:
+            operation, parameters = args
+            task_dict = {"operation": operation, "parameters": parameters}
+            return_legacy = True
+            logger.debug("Legacy positional call")
+        
+        # Single dict argument
+        elif len(args) == 1 and isinstance(args[0], dict):
+            task_dict = args[0]
+            # Check if standardized request (has task_id and task_description)
+            if "task_id" in task_dict and "task_description" in task_dict:
+                return_legacy = False
+                logger.debug(f"Standardized request call: task_id={task_dict.get('task_id')}")
+            else:
+                return_legacy = True
+                logger.debug("Legacy dict call")
+            operation = task_dict.get("operation")
+            parameters = task_dict.get("parameters", {})
+        
+        # Keyword arguments (operation=..., parameters=...)
+        elif "operation" in kwargs:
+            operation = kwargs.get("operation")
+            parameters = kwargs.get("parameters", {})
+            task_dict = {"operation": operation, "parameters": parameters}
+            return_legacy = True
+            logger.debug("Legacy keyword call")
+        
+        else:
+            raise InvalidParameterError(
+                parameter_name="task",
+                message="Invalid call to execute_task. Use one of:\n"
+                "  - execute_task(operation, parameters)\n"
+                "  - execute_task({'operation': ..., 'parameters': ...})\n"
+                "  - execute_task(AgentExecutionRequest)"
+            )
+        
+        try:
+            task_id = task_dict.get("task_id", f"data_extract_{int(time.time())}")  # type: ignore
+            
+            # Ensure parameters is not None
+            if parameters is None:
+                parameters = {}
+            
+            # Ensure operation is not None
+            if operation is None:
+                operation = "unknown"
+            
+            logger.info(f"Executing data extraction operation: {operation} (task_id={task_id})")
+            
+            # Execute the operation using existing methods
+            if operation == "extract_relevant_data":
+                result = self.extract_relevant_data(
+                    input_folder=parameters.get('input_folder', ''),
+                    objective=parameters.get('objective', ''),
+                    keywords=parameters.get('keywords'),
+                    temp_folder=parameters.get('temp_folder'),
+                    max_files=parameters.get('max_files', 20),
+                    max_content_per_file=parameters.get('max_content_per_file', 5000),
+                    max_total_content=parameters.get('max_total_content', 50000),
+                    file_types=parameters.get('file_types')
+                )
+            
+            elif operation == "get_file_preview":
+                result = self.get_file_preview(
+                    file_path=parameters.get('file_path', ''),
+                    max_chars=parameters.get('max_chars', 2000)
+                )
+            
+            elif operation == "search_in_files":
+                result = self.search_in_files(
+                    input_folder=parameters.get('input_folder', ''),
+                    search_query=parameters.get('search_query', ''),
+                    file_types=parameters.get('file_types'),
+                    max_results=parameters.get('max_results', 10)
+                )
+            
+            else:
+                result = {
+                    "success": False,
+                    "error": f"Unknown operation: {operation}",
+                    "supported_operations": self.supported_operations
+                }
+            
+            # Convert legacy result to standardized response
+            standard_response = self._convert_to_standard_response(
+                result,
+                operation,
+                task_id,
+                start_time
+            )
+            
+            # Publish completion event for event-driven workflows
+            self._publish_completion_event(task_id, operation, standard_response)
+            
+            # Return in requested format
+            if return_legacy:
+                # Convert back to legacy format for backward compatibility
+                return self._convert_to_legacy_response(standard_response)
+            else:
+                return standard_response
+        
+        except Exception as e:
+            logger.error(f"Error executing DataExtraction task: {e}", exc_info=True)
+            
+            # Create standardized error response
+            error = exception_to_error_response(
+                e,
+                source=self.agent_name,
+                task_id=task_dict.get("task_id", "unknown") if task_dict else "unknown"
+            )
+            
+            error_response: AgentExecutionResponse = {
+                "status": "failure",
+                "success": False,
+                "result": {},
+                "artifacts": [],
+                "execution_time_ms": int((time.time() - start_time) * 1000),
+                "timestamp": datetime.now().isoformat(),
+                "agent_name": self.agent_name,
+                "operation": operation or "unknown",
+                "blackboard_entries": [],
+                "warnings": []
+            }
+            # Add error field separately to handle TypedDict
+            error_response["error"] = error  # type: ignore
+            
+            if return_legacy:
+                return self._convert_to_legacy_response(error_response)
+            else:
+                return error_response
+    
+    def _convert_to_standard_response(
+        self,
+        legacy_result: Dict[str, Any],
+        operation: str,
+        task_id: str,
+        start_time: float
+    ) -> AgentExecutionResponse:
+        """Convert legacy result dict to standardized AgentExecutionResponse."""
+        success = legacy_result.get("success", True)
+        
+        # Extract artifacts from result (if any output files were created)
+        artifacts = []
+        
+        # Create blackboard entries for sharing extracted data
+        blackboard_entries = []
+        
+        # For extract_relevant_data, share extractions
+        if operation == "extract_relevant_data" and success and "extractions" in legacy_result:
+            blackboard_entries.append({
+                "key": f"extracted_data_{task_id}",
+                "value": legacy_result.get("extractions", []),
+                "scope": "workflow",
+                "ttl_seconds": 3600
+            })
+            
+            # Share summary as well
+            if "summary" in legacy_result:
+                blackboard_entries.append({
+                    "key": f"extraction_summary_{task_id}",
+                    "value": legacy_result.get("summary", ""),
+                    "scope": "workflow",
+                    "ttl_seconds": 3600
+                })
+        
+        # For file preview, share content
+        if operation == "get_file_preview" and success and "content" in legacy_result:
+            blackboard_entries.append({
+                "key": f"file_preview_{task_id}",
+                "value": legacy_result.get("content", ""),
+                "scope": "workflow",
+                "ttl_seconds": 1800
+            })
+        
+        # For search, share results
+        if operation == "search_in_files" and success and "results" in legacy_result:
+            blackboard_entries.append({
+                "key": f"search_results_{task_id}",
+                "value": legacy_result.get("results", []),
+                "scope": "workflow",
+                "ttl_seconds": 1800
+            })
+        
+        # Build standardized response
+        response: AgentExecutionResponse = {
+            "status": "success" if success else "failure",
+            "success": success,
+            "result": legacy_result,
+            "artifacts": artifacts,
+            "execution_time_ms": int((time.time() - start_time) * 1000),
+            "timestamp": datetime.now().isoformat(),
+            "agent_name": self.agent_name,
+            "operation": operation,
+            "blackboard_entries": blackboard_entries,
+            "warnings": []
+        }
+        
+        # Add error field if present (handle TypedDict)
+        if not success and "error" in legacy_result:
+            response["error"] = create_error_response(  # type: ignore
+                error_code="DATA_EXTRACT_001",
+                error_type="execution_error",
+                message=str(legacy_result.get("error", "Unknown error")),
+                source=self.agent_name
+            )
+        
+        return response
+    
+    def _convert_to_legacy_response(self, standard_response: AgentExecutionResponse) -> Dict[str, Any]:
+        """Convert standardized response back to legacy format for backward compatibility."""
+        # For this agent, result already contains the full legacy structure
+        legacy = standard_response["result"].copy() if isinstance(standard_response["result"], dict) else {}
+        
+        # Ensure success field is present
+        if "success" not in legacy:
+            legacy["success"] = standard_response["success"]
+        
+        # Add error if present (use .get() for NotRequired field)
+        error = standard_response.get("error")  # type: ignore
+        if error and "error" not in legacy:
+            legacy["error"] = error["message"]  # type: ignore
+        
+        return legacy
+    
+    def _publish_completion_event(
+        self,
+        task_id: str,
+        operation: str,
+        response: AgentExecutionResponse
+    ):
+        """Publish task completion event for event-driven workflows."""
+        try:
+            # Choose event type based on operation
+            event_type_map = {
+                "extract_relevant_data": "data_extracted",
+                "get_file_preview": "file_preview_ready",
+                "search_in_files": "search_completed"
+            }
+            
+            event_type = event_type_map.get(operation, "data_extraction_completed")
+            
+            event = create_system_event(
+                event_type=event_type,
+                event_category="task_lifecycle",
+                source_agent=self.agent_name,
+                payload={
+                    "task_id": task_id,
+                    "operation": operation,
+                    "success": response["success"],
+                    "artifacts": response["artifacts"],
+                    "blackboard_keys": [entry["key"] for entry in response["blackboard_entries"]]
+                }
+            )
+            self.event_bus.publish(event)
+            logger.debug(f"Published completion event for task {task_id}")
+        except Exception as e:
+            logger.warning(f"Failed to publish completion event: {e}")
     
     def extract_relevant_data(
         self,

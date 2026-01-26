@@ -18,6 +18,8 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass, asdict
 import hashlib
 
+from .exceptions import InvalidParameterError
+
 
 @dataclass
 class TempDataEntry:
@@ -179,7 +181,10 @@ class TempDataManager:
             The key for retrieval
         """
         if category not in self.CATEGORIES:
-            raise ValueError(f"Invalid category: {category}. Must be one of {self.CATEGORIES}")
+            raise InvalidParameterError(
+                parameter_name="category",
+                message=f"Invalid category: {category}. Must be one of {self.CATEGORIES}"
+            )
         
         key = self._get_key(category, name)
         file_path = self._get_path(category, name)
@@ -554,7 +559,10 @@ class TempDataManager:
             Number of entries removed
         """
         if category not in self.CATEGORIES:
-            raise ValueError(f"Invalid category: {category}")
+            raise InvalidParameterError(
+                parameter_name="category",
+                message=f"Invalid category: {category}"
+            )
         
         keys_to_delete = [
             key for key, entry in self._index.items()

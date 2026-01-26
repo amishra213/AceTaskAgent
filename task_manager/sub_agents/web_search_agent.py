@@ -5,6 +5,11 @@ This agent handles web search and content retrieval operations.
 Supports multiple search engines, static scraping, and dynamic JavaScript-heavy sites via Playwright.
 Integrates with Vision agent for screenshot analysis.
 Includes deep search capability for human-like browsing and information extraction.
+
+Migration Status: Week 7 Day 2 - Dual Format Support
+- Supports both legacy dict and standardized AgentExecutionRequest/Response
+- Maintains 100% backward compatibility
+- Publishes SystemEvent on completion for event-driven workflows
 """
 
 import logging
@@ -16,6 +21,28 @@ import asyncio
 import tempfile
 import re
 import os
+import time
+
+# Import standardized schemas and utilities (Week 1-2 implementation)
+from task_manager.models import (
+    AgentExecutionRequest,
+    AgentExecutionResponse,
+    create_system_event,
+    create_error_response
+)
+from task_manager.utils import (
+    auto_convert_response,
+    validate_agent_execution_response,
+    exception_to_error_response,
+    InvalidParameterError,
+    InvalidOperationError,
+    WebSearchError,
+    ScrapingError,
+    MissingDependencyError,
+    NetworkError,
+    wrap_exception
+)
+from task_manager.core.event_bus import get_event_bus
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +51,8 @@ class WebSearchAgent:
     """Agent for handling web search, static scraping, and dynamic web interaction."""
     
     def __init__(self):
-        """Initialize the Web Search Agent."""
+        """Initialize the Web Search Agent with dual-format support."""
+        self.agent_name = "web_search_agent"
         self.supported_operations = [
             "search",
             "scrape",
@@ -36,6 +64,10 @@ class WebSearchAgent:
             "deep_search",
             "research"
         ]
+        
+        # Initialize event bus for event-driven workflows
+        self.event_bus = get_event_bus()
+        
         self.search_lib = self._check_dependencies()
         self.playwright_available = self._check_playwright()
         
@@ -48,7 +80,7 @@ class WebSearchAgent:
         # Custom search engine URL (if provided - for future use)
         self.custom_search_url = os.getenv('WEBSEARCH_CUSTOM_URL', None)
         
-        logger.info(f"Web Search Agent initialized (backend={self.default_backend}, region={self.default_region})")
+        logger.info(f"Web Search Agent initialized with dual-format support (backend={self.default_backend}, region={self.default_region})")
     
     def _check_dependencies(self) -> Optional[str]:
         """
@@ -1605,132 +1637,389 @@ class WebSearchAgent:
 
     def execute_task(
         self,
-        operation: str,
-        parameters: Dict[str, Any]
-    ) -> Dict[str, Any]:
+        *args: Any,
+        **kwargs: Any
+    ) -> Union[Dict[str, Any], AgentExecutionResponse]:
         """
-        Execute a web search operation based on operation type.
+        Execute a web search operation with dual-format support.
+        
+        Supports three calling conventions:
+        1. Legacy positional: execute_task(operation, parameters)
+        2. Legacy dict: execute_task({'operation': ..., 'parameters': ...})
+        3. Standardized: execute_task(AgentExecutionRequest)
         
         Args:
-            operation: Type of operation (search, scrape, fetch, summarize, smart_scrape, 
-                      capture_screenshot, handle_pagination, deep_search, research)
-            parameters: Operation parameters
+            *args: Variable positional arguments
+            **kwargs: Variable keyword arguments
         
         Returns:
-            Result dictionary
+            Legacy dict OR AgentExecutionResponse based on input format
         """
-        # Normalize operation aliases to standard operations
-        operation_aliases = {
-            'web_search': 'search',
-            'websearch': 'search',
-            'search_web': 'search',
-            'web_scrape': 'scrape',
-            'webscrape': 'scrape',
-            'scrape_web': 'scrape',
-            'get': 'fetch',
-            'download': 'fetch',
-            'retrieve': 'fetch',
-            'screenshot': 'capture_screenshot',
-            'capture': 'capture_screenshot',
-            'paginate': 'handle_pagination',
-            'pagination': 'handle_pagination',
-            'deep': 'deep_search',
-            'browse': 'deep_search',
-            'explore': 'deep_search',
-            'investigate': 'research',
-            'study': 'research'
+        start_time = time.time()
+        return_legacy = True
+        operation = None
+        parameters = None
+        task_dict = None
+        
+        # Detect calling convention
+        # Positional arguments (operation, parameters)
+        if len(args) == 2:
+            operation, parameters = args
+            task_dict = {"operation": operation, "parameters": parameters}
+            return_legacy = True
+            logger.debug("Legacy positional call")
+        
+        # Single dict argument
+        elif len(args) == 1 and isinstance(args[0], dict):
+            task_dict = args[0]
+            # Check if standardized request (has task_id and task_description)
+            if "task_id" in task_dict and "task_description" in task_dict:
+                return_legacy = False
+                logger.debug(f"Standardized request call: task_id={task_dict.get('task_id')}")
+            else:
+                return_legacy = True
+                logger.debug("Legacy dict call")
+            operation = task_dict.get("operation")
+            parameters = task_dict.get("parameters", {})
+        
+        # Keyword arguments (operation=..., parameters=...)
+        elif "operation" in kwargs:
+            operation = kwargs.get("operation")
+            parameters = kwargs.get("parameters", {})
+            task_dict = {"operation": operation, "parameters": parameters}
+            return_legacy = True
+            logger.debug("Legacy keyword call")
+        
+        else:
+            raise InvalidParameterError(
+                parameter_name="task",
+                message="Invalid call to execute_task. Use one of:\n"
+                "  - execute_task(operation, parameters)\n"
+                "  - execute_task({'operation': ..., 'parameters': ...})\n"
+                "  - execute_task(AgentExecutionRequest)"
+            )
+        
+        try:
+            task_id = task_dict.get("task_id", f"websearch_{int(time.time())}")  # type: ignore
+            
+            # Ensure parameters is not None
+            if parameters is None:
+                parameters = {}
+            
+            # Ensure operation is not None
+            if operation is None:
+                operation = "unknown"
+            
+            # Normalize operation aliases to standard operations
+            operation_aliases = {
+                'web_search': 'search',
+                'websearch': 'search',
+                'search_web': 'search',
+                'web_scrape': 'scrape',
+                'webscrape': 'scrape',
+                'scrape_web': 'scrape',
+                'get': 'fetch',
+                'download': 'fetch',
+                'retrieve': 'fetch',
+                'screenshot': 'capture_screenshot',
+                'capture': 'capture_screenshot',
+                'paginate': 'handle_pagination',
+                'pagination': 'handle_pagination',
+                'deep': 'deep_search',
+                'browse': 'deep_search',
+                'explore': 'deep_search',
+                'investigate': 'research',
+                'study': 'research'
+            }
+            
+            # Normalize operation to lowercase and check for aliases
+            normalized_operation = operation.lower().strip()
+            if normalized_operation in operation_aliases:
+                actual_operation = operation_aliases[normalized_operation]
+                logger.info(f"Executing web search operation: {operation} (normalized to: {actual_operation}, task_id={task_id})")
+                operation = actual_operation
+            else:
+                logger.info(f"Executing web search operation: {operation} (task_id={task_id})")
+            
+            # Also handle common parameter aliases
+            # Map 'num_results' to 'max_results'
+            if 'num_results' in parameters and 'max_results' not in parameters:
+                parameters['max_results'] = parameters['num_results']
+                logger.debug(f"Mapped parameter 'num_results' to 'max_results'")
+            
+            # Execute the operation using existing methods
+            if operation == "search":
+                result = self.search(
+                    query=parameters.get('query', ''),
+                    max_results=parameters.get('max_results', 10),
+                    language=parameters.get('language', 'en'),
+                    source=parameters.get('source')
+                )
+            
+            elif operation == "scrape":
+                result = self.scrape(
+                    url=parameters.get('url', ''),
+                    extract_text=parameters.get('extract_text', True),
+                    extract_links=parameters.get('extract_links', True),
+                    extract_images=parameters.get('extract_images', False)
+                )
+            
+            elif operation == "smart_scrape":
+                result = self.smart_scrape(
+                    url=parameters.get('url', ''),
+                    wait_selector=parameters.get('wait_selector'),
+                    handle_pagination=parameters.get('handle_pagination', False),
+                    max_pages=parameters.get('max_pages', 3),
+                    scroll_pause_time=parameters.get('scroll_pause_time', 1.0)
+                )
+            
+            elif operation == "capture_screenshot":
+                result = self.capture_screenshot(
+                    url=parameters.get('url', ''),
+                    selector=parameters.get('selector'),
+                    output_dir=parameters.get('output_dir'),
+                    wait_selector=parameters.get('wait_selector')
+                )
+            
+            elif operation == "handle_pagination":
+                result = self.handle_pagination(
+                    url=parameters.get('url', ''),
+                    next_button_selector=parameters.get('next_button_selector', ''),
+                    content_selector=parameters.get('content_selector', ''),
+                    max_pages=parameters.get('max_pages', 5)
+                )
+            
+            elif operation == "fetch":
+                result = self.fetch(
+                    url=parameters.get('url', ''),
+                    save_to_file=parameters.get('save_to_file'),
+                    headers=parameters.get('headers')
+                )
+            
+            elif operation == "summarize":
+                result = self.summarize(
+                    url=parameters.get('url', ''),
+                    max_sentences=parameters.get('max_sentences', 5)
+                )
+            
+            elif operation == "deep_search":
+                result = self.deep_search(
+                    query=parameters.get('query', ''),
+                    target_url=parameters.get('target_url') or parameters.get('url'),
+                    max_results=parameters.get('max_results', 5),
+                    max_depth=parameters.get('max_depth', 2),
+                    relevance_keywords=parameters.get('relevance_keywords'),
+                    extract_structured_data=parameters.get('extract_structured_data', True)
+                )
+            
+            elif operation == "research":
+                result = self.research(
+                    topic=parameters.get('topic', parameters.get('query', '')),
+                    target_url=parameters.get('target_url') or parameters.get('url'),
+                    search_engines=parameters.get('search_engines', ['duckduckgo']),
+                    max_sources=parameters.get('max_sources', 5)
+                )
+            
+            else:
+                result = {
+                    "success": False,
+                    "error": f"Unknown operation: {operation}",
+                    "supported_operations": self.supported_operations
+                }
+            
+            # Convert legacy result to standardized response
+            standard_response = self._convert_to_standard_response(
+                result,
+                operation,
+                task_id,
+                start_time
+            )
+            
+            # Publish completion event for event-driven workflows
+            self._publish_completion_event(task_id, operation, standard_response)
+            
+            # Return in requested format
+            if return_legacy:
+                # Convert back to legacy format for backward compatibility
+                return self._convert_to_legacy_response(standard_response)
+            else:
+                return standard_response
+        
+        except Exception as e:
+            logger.error(f"Error executing WebSearch task: {e}", exc_info=True)
+            
+            # Create standardized error response
+            error = exception_to_error_response(
+                e,
+                source=self.agent_name,
+                task_id=task_dict.get("task_id", "unknown") if task_dict else "unknown"
+            )
+            
+            error_response: AgentExecutionResponse = {
+                "status": "failure",
+                "success": False,
+                "result": {},
+                "artifacts": [],
+                "execution_time_ms": int((time.time() - start_time) * 1000),
+                "timestamp": datetime.now().isoformat(),
+                "agent_name": self.agent_name,
+                "operation": operation or "unknown",
+                "blackboard_entries": [],
+                "warnings": []
+            }
+            # Add error field separately to handle TypedDict
+            error_response["error"] = error  # type: ignore
+            
+            if return_legacy:
+                return self._convert_to_legacy_response(error_response)
+            else:
+                return error_response
+    
+    def _convert_to_standard_response(
+        self,
+        legacy_result: Dict[str, Any],
+        operation: str,
+        task_id: str,
+        start_time: float
+    ) -> AgentExecutionResponse:
+        """Convert legacy result dict to standardized AgentExecutionResponse."""
+        success = legacy_result.get("success", False)
+        
+        # Extract artifacts from result
+        artifacts = []
+        
+        # Handle output files (CSV, JSON, screenshots)
+        if "output_file" in legacy_result and success:
+            output_file = legacy_result["output_file"]
+            if Path(output_file).exists():
+                # Determine artifact type from extension
+                ext = Path(output_file).suffix.lower()
+                artifact_type = ext[1:] if ext else "file"  # Remove the dot
+                
+                artifacts.append({
+                    "type": artifact_type,
+                    "path": str(output_file),
+                    "size_bytes": Path(output_file).stat().st_size,
+                    "description": f"WebSearch {operation} output file"
+                })
+        
+        # Handle screenshot paths
+        if "screenshot_path" in legacy_result and success:
+            screenshot_path = legacy_result["screenshot_path"]
+            if Path(screenshot_path).exists():
+                artifacts.append({
+                    "type": "png",
+                    "path": str(screenshot_path),
+                    "size_bytes": Path(screenshot_path).stat().st_size,
+                    "description": f"Screenshot from {operation} operation"
+                })
+        
+        # Create blackboard entries for sharing data
+        blackboard_entries = []
+        if success and "results" in legacy_result:
+            blackboard_entries.append({
+                "key": f"websearch_results_{task_id}",
+                "value": legacy_result.get("results", []),
+                "scope": "workflow",
+                "ttl_seconds": 3600
+            })
+        
+        if success and "summary" in legacy_result:
+            blackboard_entries.append({
+                "key": f"websearch_summary_{task_id}",
+                "value": legacy_result.get("summary", ""),
+                "scope": "workflow",
+                "ttl_seconds": 3600
+            })
+        
+        # Build standardized response
+        response: AgentExecutionResponse = {
+            "status": "success" if success else "failure",
+            "success": success,
+            "result": {
+                k: v for k, v in legacy_result.items()
+                if k not in ["success", "output_file", "screenshot_path"]
+            },
+            "artifacts": artifacts,
+            "execution_time_ms": int((time.time() - start_time) * 1000),
+            "timestamp": datetime.now().isoformat(),
+            "agent_name": self.agent_name,
+            "operation": operation,
+            "blackboard_entries": blackboard_entries,
+            "warnings": []
         }
         
-        # Normalize operation to lowercase and check for aliases
-        normalized_operation = operation.lower().strip()
-        if normalized_operation in operation_aliases:
-            actual_operation = operation_aliases[normalized_operation]
-            logger.info(f"Executing web search operation: {operation} (normalized to: {actual_operation})")
-            operation = actual_operation
-        else:
-            logger.info(f"Executing web search operation: {operation}")
-        
-        # Also handle common parameter aliases
-        # Map 'num_results' to 'max_results'
-        if 'num_results' in parameters and 'max_results' not in parameters:
-            parameters['max_results'] = parameters['num_results']
-            logger.debug(f"Mapped parameter 'num_results' to 'max_results'")
-        
-        if operation == "search":
-            return self.search(
-                query=parameters.get('query', ''),
-                max_results=parameters.get('max_results', 10),
-                language=parameters.get('language', 'en'),
-                source=parameters.get('source')
+        # Add error field if present (handle TypedDict)
+        if not success and "error" in legacy_result:
+            response["error"] = create_error_response(  # type: ignore
+                error_code="WEBSEARCH_001",
+                error_type="execution_error",
+                message=legacy_result.get("error", "Unknown error"),
+                source=self.agent_name
             )
         
-        elif operation == "scrape":
-            return self.scrape(
-                url=parameters.get('url', ''),
-                extract_text=parameters.get('extract_text', True),
-                extract_links=parameters.get('extract_links', True),
-                extract_images=parameters.get('extract_images', False)
-            )
+        return response
+    
+    def _convert_to_legacy_response(self, standard_response: AgentExecutionResponse) -> Dict[str, Any]:
+        """Convert standardized response back to legacy format for backward compatibility."""
+        legacy = {
+            "success": standard_response["success"],
+        }
         
-        elif operation == "smart_scrape":
-            return self.smart_scrape(
-                url=parameters.get('url', ''),
-                wait_selector=parameters.get('wait_selector'),
-                handle_pagination=parameters.get('handle_pagination', False),
-                max_pages=parameters.get('max_pages', 3),
-                scroll_pause_time=parameters.get('scroll_pause_time', 1.0)
-            )
+        # Add output_file from artifacts
+        if standard_response["artifacts"]:
+            # Find first CSV, JSON, or other file artifact
+            for artifact in standard_response["artifacts"]:
+                if artifact["type"] in ["csv", "json", "txt", "md"]:
+                    legacy["output_file"] = artifact["path"]
+                    break
+                elif artifact["type"] == "png":
+                    legacy["screenshot_path"] = artifact["path"]
         
-        elif operation == "capture_screenshot":
-            return self.capture_screenshot(
-                url=parameters.get('url', ''),
-                selector=parameters.get('selector'),
-                output_dir=parameters.get('output_dir'),
-                wait_selector=parameters.get('wait_selector')
-            )
+        # Add error if present (use .get() for NotRequired field)
+        error = standard_response.get("error")  # type: ignore
+        if error:
+            legacy["error"] = error["message"]  # type: ignore
         
-        elif operation == "handle_pagination":
-            return self.handle_pagination(
-                url=parameters.get('url', ''),
-                next_button_selector=parameters.get('next_button_selector', ''),
-                content_selector=parameters.get('content_selector', ''),
-                max_pages=parameters.get('max_pages', 5)
-            )
+        # Merge result fields into top level (legacy pattern)
+        if isinstance(standard_response["result"], dict):
+            for key, value in standard_response["result"].items():
+                if key not in legacy:
+                    legacy[key] = value
         
-        elif operation == "fetch":
-            return self.fetch(
-                url=parameters.get('url', ''),
-                save_to_file=parameters.get('save_to_file'),
-                headers=parameters.get('headers')
+        return legacy
+    
+    def _publish_completion_event(
+        self,
+        task_id: str,
+        operation: str,
+        response: AgentExecutionResponse
+    ):
+        """Publish task completion event for event-driven workflows."""
+        try:
+            # Choose event type based on operation
+            if operation in ["search", "deep_search", "research"]:
+                event_type = "web_search_completed"
+            elif operation in ["scrape", "smart_scrape", "fetch"]:
+                event_type = "web_scrape_completed"
+            elif "csv" in str(response.get("artifacts", [])):
+                event_type = "csv_generated"
+            else:
+                event_type = "web_operation_completed"
+            
+            event = create_system_event(
+                event_type=event_type,
+                event_category="task_lifecycle",
+                source_agent=self.agent_name,
+                payload={
+                    "task_id": task_id,
+                    "operation": operation,
+                    "success": response["success"],
+                    "artifacts": response["artifacts"],
+                    "blackboard_keys": [entry["key"] for entry in response["blackboard_entries"]]
+                }
             )
-        
-        elif operation == "summarize":
-            return self.summarize(
-                url=parameters.get('url', ''),
-                max_sentences=parameters.get('max_sentences', 5)
-            )
-        
-        elif operation == "deep_search":
-            return self.deep_search(
-                query=parameters.get('query', ''),
-                target_url=parameters.get('target_url') or parameters.get('url'),
-                max_results=parameters.get('max_results', 5),
-                max_depth=parameters.get('max_depth', 2),
-                relevance_keywords=parameters.get('relevance_keywords'),
-                extract_structured_data=parameters.get('extract_structured_data', True)
-            )
-        
-        elif operation == "research":
-            return self.research(
-                topic=parameters.get('topic', parameters.get('query', '')),
-                target_url=parameters.get('target_url') or parameters.get('url'),
-                search_engines=parameters.get('search_engines', ['duckduckgo']),
-                max_sources=parameters.get('max_sources', 5)
-            )
-        
-        else:
-            return {
-                "success": False,
-                "error": f"Unknown operation: {operation}",
-                "supported_operations": self.supported_operations
-            }
+            self.event_bus.publish(event)
+            logger.debug(f"Published completion event for task {task_id}")
+        except Exception as e:
+            logger.warning(f"Failed to publish completion event: {e}")

@@ -2,7 +2,7 @@
 Agent module - Main TaskManagerAgent implementation
 """
 
-from typing import Literal, List, Optional, Dict, Any, Tuple
+from typing import Literal, List, Optional, Dict, Any, Tuple, cast
 from datetime import datetime
 import json
 import hashlib
@@ -12,6 +12,7 @@ from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from task_manager.models import AgentState, TaskStatus, Task, PlanNode, BlackboardEntry, HistoryEntry
+from task_manager.models.messages import AgentExecutionRequest, AgentExecutionResponse
 from task_manager.config import AgentConfig
 from task_manager.utils.logger import get_logger
 from task_manager.utils.prompt_builder import PromptBuilder
@@ -19,9 +20,13 @@ from task_manager.utils.rate_limiter import global_rate_limiter
 from task_manager.utils.input_context import InputContext
 from task_manager.utils.temp_manager import TempDataManager
 from task_manager.utils.redis_cache import RedisCacheManager
+from task_manager.utils.exceptions import (
+    InvalidParameterError,
+    MissingDependencyError
+)
 from task_manager.sub_agents import (
     PDFAgent, ExcelAgent, OCRImageAgent, WebSearchAgent, 
-    CodeInterpreterAgent, DataExtractionAgent
+    CodeInterpreterAgent, DataExtractionAgent, ProblemSolverAgent
 )
 from .workflow import WorkflowBuilder
 from .master_planner import MasterPlanner, PlanStatus, BlackboardType
@@ -117,6 +122,9 @@ class TaskManagerAgent:
         self.code_interpreter_agent = CodeInterpreterAgent(llm=self.llm)
         # Note: data_extraction_agent already initialized above for context building
         
+        # Initialize ProblemSolverAgent for LLM-based error analysis and human input interpretation
+        self.problem_solver_agent = ProblemSolverAgent(llm_client=self.llm)
+        
         # Initialize Redis cache manager for task result caching
         self.cache = RedisCacheManager()
         if self.cache.redis_available:
@@ -136,7 +144,7 @@ class TaskManagerAgent:
         self.app = self.workflow.compile(checkpointer=self.memory)
         
         logger.debug(f"Agent initialized with max_iterations={self.config.max_iterations}")
-        logger.debug("Sub-agents initialized: PDFAgent, ExcelAgent, OCRImageAgent, WebSearchAgent, CodeInterpreterAgent")
+        logger.debug("Sub-agents initialized: PDFAgent, ExcelAgent, OCRImageAgent, WebSearchAgent, CodeInterpreterAgent, ProblemSolverAgent")
     
     
     def _initialize_llm(self):
@@ -227,14 +235,16 @@ class TaskManagerAgent:
                 return Ollama(**kwargs)
             
             else:
-                raise ValueError(
-                    f"Unsupported LLM provider: {provider}. "
+                raise InvalidParameterError(
+                    parameter_name="provider",
+                    message=f"Unsupported LLM provider: {provider}. "
                     f"Supported providers: anthropic, openai, google, groq, local"
                 )
         except ImportError as e:
-            raise ImportError(
-                f"Missing package for {provider} provider. "
-                f"Install with: pip install langchain-{provider}"
+            raise MissingDependencyError(
+                package_name=f"langchain-{provider}",
+                install_command=f"pip install langchain-{provider}",
+                purpose=f"{provider} LLM provider"
             ) from e
     
     
@@ -492,12 +502,14 @@ class TaskManagerAgent:
         logger.info(f"[SELECT] Completed: {len(completed)} ({progress_pct}%)")
         logger.info(f"[SELECT] Failed: {len(failed)}")
         
-        # Find pending tasks (not completed, not failed)
+        # Find pending tasks (not completed, not failed, and status is PENDING)
+        # NOTE: BROKEN_DOWN tasks are NOT selected - they are intermediate states
+        # We only select leaf tasks that are ready to execute
         pending_tasks = [
             t for t in tasks 
             if t['id'] not in completed 
             and t['id'] not in failed
-            and t['status'] == TaskStatus.PENDING
+            and t.get('status') == TaskStatus.PENDING  # Use .get() for safety
         ]
         
         logger.info(f"[SELECT] Pending tasks: {len(pending_tasks)}")
@@ -506,6 +518,26 @@ class TaskManagerAgent:
         if pending_tasks:
             pending_ids = [t['id'] for t in pending_tasks]
             logger.info(f"[SELECT] Pending task IDs: {pending_ids}")
+        else:
+            # Additional debugging if no pending tasks found
+            logger.warning("[SELECT] No PENDING tasks found, checking task statuses:")
+            status_counts = {}
+            for t in tasks:
+                status = t.get('status', 'UNKNOWN')
+                status_counts[str(status)] = status_counts.get(str(status), 0) + 1
+            for status, count in status_counts.items():
+                logger.warning(f"[SELECT]   {status}: {count} tasks")
+            
+            # Check if there are tasks that aren't completed or failed
+            unfinished_tasks = [
+                t for t in tasks 
+                if t['id'] not in completed 
+                and t['id'] not in failed
+            ]
+            if unfinished_tasks:
+                logger.warning(f"[SELECT] Found {len(unfinished_tasks)} unfinished tasks (not completed/failed)")
+                for t in unfinished_tasks[:5]:  # Log first 5
+                    logger.warning(f"[SELECT]   Task {t['id']}: status={t.get('status')}, desc={t.get('description', 'N/A')[:50]}...")
         
         if not pending_tasks:
             logger.info("[SELECT] No pending tasks found - workflow will check completion")
@@ -910,14 +942,38 @@ class TaskManagerAgent:
             logger.info(f"[PDF AGENT] Parameters: {parameters}")
             logger.info("-" * 80)
             
-            # Execute the operation via PDF Agent
-            logger.info(f"[PDF AGENT] Calling PDFAgent.execute_task()...")
-            result_data = self.pdf_agent.execute_task(operation, parameters)
+            # Create standardized AgentExecutionRequest
+            logger.info(f"[PDF AGENT] Calling PDFAgent.execute_task() with standardized request...")
+            request: AgentExecutionRequest = {
+                "task_id": task_id,
+                "task_description": task['description'],
+                "task_type": "atomic",
+                "operation": operation,
+                "parameters": parameters,
+                "input_data": file_operation,
+                "temp_folder": str(self.config.folders.temp_path),
+                "output_folder": str(self.config.folders.output_path),
+                "cache_enabled": True,
+                "blackboard": cast(list[dict[str, Any]], state.get('blackboard', [])),
+                "relevant_entries": [],
+                "max_retries": 3
+            }
+            
+            # Execute using standardized interface
+            response: AgentExecutionResponse = self.pdf_agent.execute_task(request=request)
+            
+            # Extract legacy-compatible result_data from standardized response
+            result_data = {
+                'success': response['success'],
+                'summary': response['result'].get('summary', ''),
+                'findings': response['result'].get('findings', {}),
+                **response['result']  # Include all other result fields
+            }
             
             # Update task with results
             updated_task = {
                 **task,
-                "status": TaskStatus.COMPLETED if result_data.get('success') else TaskStatus.FAILED,
+                "status": TaskStatus.COMPLETED if response['success'] else TaskStatus.FAILED,
                 "result": result_data,
                 "updated_at": datetime.now().isoformat()
             }
@@ -932,7 +988,10 @@ class TaskManagerAgent:
             logger.info(f"[PDF AGENT] Status: {updated_task['status']}")
             logger.info(f"[PDF AGENT] Result Summary: {result_data.get('summary', 'N/A')[:100]}...")
             
-            # Create blackboard entry with findings and file pointers
+            # Merge blackboard entries from agent response with task-specific entry
+            agent_blackboard_entries = response.get('blackboard_entries', [])
+            
+            # Create additional blackboard entry with findings and file pointers
             blackboard_entry: BlackboardEntry = {
                 "entry_type": "pdf_extraction_result",
                 "source_agent": "pdf_agent",
@@ -941,7 +1000,8 @@ class TaskManagerAgent:
                     "operation": operation,
                     "success": result_data.get('success'),
                     "summary": result_data.get('summary', ''),
-                    "findings": result_data.get('findings', {})
+                    "findings": result_data.get('findings', {}),
+                    "execution_time_ms": response.get('execution_time_ms', 0)
                 },
                 "timestamp": datetime.now().isoformat(),
                 "relevant_to": [task_id],
@@ -1076,14 +1136,39 @@ class TaskManagerAgent:
             logger.info(f"[EXCEL AGENT] Parameters: {parameters}")
             logger.info("-" * 80)
             
-            # Execute the operation via Excel Agent
-            logger.info(f"[EXCEL AGENT] Calling ExcelAgent.execute_task()...")
-            result_data = self.excel_agent.execute_task(operation, parameters)
+            # Create standardized AgentExecutionRequest
+            logger.info(f"[EXCEL AGENT] Calling ExcelAgent.execute_task() with standardized request...")
+            request: AgentExecutionRequest = {
+                "task_id": task_id,
+                "task_description": task['description'],
+                "task_type": "atomic",
+                "operation": operation,
+                "parameters": parameters,
+                "input_data": file_operation,
+                "temp_folder": str(self.config.folders.temp_path),
+                "output_folder": str(self.config.folders.output_path),
+                "cache_enabled": True,
+                "blackboard": cast(list[dict[str, Any]], state.get('blackboard', [])),
+                "relevant_entries": [],
+                "max_retries": 3
+            }
+            
+            # Execute using standardized interface
+            response = cast(AgentExecutionResponse, self.excel_agent.execute_task(request=request))
+            
+            # Extract legacy-compatible result_data from standardized response
+            result_data = {
+                'success': response['success'],
+                'rows_processed': response['result'].get('rows_processed', 0),
+                'output_file': response['result'].get('output_file', ''),
+                'findings': response['result'].get('findings', {}),
+                **response['result']  # Include all other result fields
+            }
             
             # Update task with results
             updated_task = {
                 **task,
-                "status": TaskStatus.COMPLETED if result_data.get('success') else TaskStatus.FAILED,
+                "status": TaskStatus.COMPLETED if response['success'] else TaskStatus.FAILED,
                 "result": result_data,
                 "updated_at": datetime.now().isoformat()
             }
@@ -1098,7 +1183,10 @@ class TaskManagerAgent:
             logger.info(f"[EXCEL AGENT] Status: {updated_task['status']}")
             logger.info(f"[EXCEL AGENT] Rows Processed: {result_data.get('rows_processed', 0)}")
             
-            # Create blackboard entry with final processed results
+            # Merge blackboard entries from agent response
+            agent_blackboard_entries = response.get('blackboard_entries', [])
+            
+            # Create additional blackboard entry with final processed results
             blackboard_entry: BlackboardEntry = {
                 "entry_type": "excel_processing_result",
                 "source_agent": "excel_agent",
@@ -1109,7 +1197,8 @@ class TaskManagerAgent:
                     "success": result_data.get('success'),
                     "rows_processed": result_data.get('rows_processed', 0),
                     "output_file": result_data.get('output_file', ''),
-                    "findings": result_data.get('findings', {})
+                    "findings": result_data.get('findings', {}),
+                    "execution_time_ms": response.get('execution_time_ms', 0)
                 },
                 "timestamp": datetime.now().isoformat(),
                 "relevant_to": [task_id],
@@ -1324,14 +1413,38 @@ class TaskManagerAgent:
             logger.info(f"[OCR AGENT] Parameters: {parameters}")
             logger.info("-" * 80)
             
-            # Execute the operation via OCR Image Agent
-            logger.info(f"[OCR AGENT] Calling OCRImageAgent.run_operation()...")
-            result_data = self.ocr_image_agent.run_operation(operation, parameters)
+            # Create standardized AgentExecutionRequest
+            logger.info(f"[OCR AGENT] Calling OCRImageAgent.execute_task() with standardized request...")
+            request: AgentExecutionRequest = {
+                "task_id": task_id,
+                "task_description": task['description'],
+                "task_type": "atomic",
+                "operation": operation,
+                "parameters": parameters,
+                "input_data": file_operation,
+                "temp_folder": str(self.config.folders.temp_path),
+                "output_folder": str(self.config.folders.output_path),
+                "cache_enabled": True,
+                "blackboard": cast(list[dict[str, Any]], state.get('blackboard', [])),
+                "relevant_entries": [],
+                "max_retries": 3
+            }
+            
+            # Execute using standardized interface
+            response = cast(AgentExecutionResponse, self.ocr_image_agent.execute_task(request=request))
+            
+            # Extract legacy-compatible result_data from standardized response
+            result_data = {
+                'success': response['success'],
+                'text': response['result'].get('text', ''),
+                'findings': response['result'].get('findings', {}),
+                **response['result']  # Include all other result fields
+            }
             
             # Update task with results
             updated_task = {
                 **task,
-                "status": TaskStatus.COMPLETED if result_data.get('success') else TaskStatus.FAILED,
+                "status": TaskStatus.COMPLETED if response['success'] else TaskStatus.FAILED,
                 "result": result_data,
                 "updated_at": datetime.now().isoformat()
             }
@@ -1586,14 +1699,38 @@ class TaskManagerAgent:
             logger.info(f"[WEB SEARCH AGENT] Parameters: {params}")
             logger.info("-" * 80)
             
-            # Execute the operation via Web Search Agent
-            logger.info(f"[WEB SEARCH AGENT] Calling WebSearchAgent.execute_task()...")
-            result_data = self.web_search_agent.execute_task(operation, params)
+            # Create standardized AgentExecutionRequest
+            logger.info(f"[WEB SEARCH AGENT] Calling WebSearchAgent.execute_task() with standardized request...")
+            request: AgentExecutionRequest = {
+                "task_id": task_id,
+                "task_description": task['description'],
+                "task_type": "atomic",
+                "operation": operation,
+                "parameters": params,
+                "input_data": params,
+                "temp_folder": str(self.config.folders.temp_path),
+                "output_folder": str(self.config.folders.output_path),
+                "cache_enabled": True,
+                "blackboard": cast(list[dict[str, Any]], state.get('blackboard', [])),
+                "relevant_entries": [],
+                "max_retries": 3
+            }
+            
+            # Execute using standardized interface
+            response = cast(AgentExecutionResponse, self.web_search_agent.execute_task(request=request))
+            
+            # Extract legacy-compatible result_data from standardized response
+            result_data = {
+                'success': response['success'],
+                'summary': response['result'].get('summary', ''),
+                'results_count': response['result'].get('results_count', 0),
+                **response['result']  # Include all other result fields
+            }
             
             # Update task with results
             updated_task = {
                 **task,
-                "status": TaskStatus.COMPLETED if result_data.get('success') else TaskStatus.FAILED,
+                "status": TaskStatus.COMPLETED if response['success'] else TaskStatus.FAILED,
                 "result": result_data,
                 "updated_at": datetime.now().isoformat()
             }
@@ -1782,14 +1919,42 @@ class TaskManagerAgent:
             logger.info(f"[CODE INTERPRETER AGENT] Parameters: {params}")
             logger.info("-" * 80)
             
-            # Execute the operation via Code Interpreter Agent
-            logger.info(f"[CODE INTERPRETER AGENT] Calling CodeInterpreterAgent.execute_task()...")
-            result_data = self.code_interpreter_agent.execute_task(operation, params)
+            # Create standardized AgentExecutionRequest
+            logger.info(f"[CODE INTERPRETER AGENT] Calling CodeInterpreterAgent.execute_task() with standardized request...")
+            request: AgentExecutionRequest = {
+                "task_id": task_id,
+                "task_description": task['description'],
+                "task_type": "atomic",
+                "operation": operation,
+                "parameters": params,
+                "input_data": params,
+                "temp_folder": str(self.config.folders.temp_path),
+                "output_folder": str(self.config.folders.output_path),
+                "cache_enabled": True,
+                "blackboard": cast(list[dict[str, Any]], state.get('blackboard', [])),
+                "relevant_entries": [],
+                "max_retries": 3
+            }
+            
+            # Execute using standardized interface
+            response: AgentExecutionResponse = self.code_interpreter_agent.execute_task(request=request)
+            
+            # Extract legacy-compatible result_data from standardized response
+            result_data = {
+                'success': response['success'],
+                'output': response['result'].get('output', ''),
+                'generated_code': response['result'].get('generated_code', ''),
+                'execution_time': response.get('execution_time_ms', 0) / 1000.0,
+                'generated_files': response['result'].get('generated_files', {}),
+                'output_directory': response['result'].get('output_directory', ''),
+                'libraries_used': response['result'].get('libraries_used', []),
+                **response['result']  # Include all other result fields
+            }
             
             # Update task with results
             updated_task = {
                 **task,
-                "status": TaskStatus.COMPLETED if result_data.get('success') else TaskStatus.FAILED,
+                "status": TaskStatus.COMPLETED if response['success'] else TaskStatus.FAILED,
                 "result": result_data,
                 "updated_at": datetime.now().isoformat()
             }
@@ -1907,7 +2072,7 @@ class TaskManagerAgent:
         try:
             # Get file operation details
             file_operation = analysis.get('file_operation') or {}
-            operation = file_operation.get('operation', 'extract_relevant')
+            operation = file_operation.get('operation', 'extract_relevant_data')
             parameters = file_operation.get('parameters', {})
             
             # Use task description as extraction objective
@@ -1917,68 +2082,50 @@ class TaskManagerAgent:
             input_folder = state.get('metadata', {}).get('input_folder', './input_folder')
             temp_folder = state.get('metadata', {}).get('temp_folder', './temp_folder')
             
-            result = None
+            # Prepare parameters for standardized interface
+            if 'input_folder' not in parameters:
+                parameters['input_folder'] = input_folder
+            if 'objective' not in parameters and operation == 'extract_relevant_data':
+                parameters['objective'] = extraction_objective
+            if 'temp_folder' not in parameters:
+                parameters['temp_folder'] = temp_folder
             
-            if operation == 'extract_relevant':
-                # Main extraction operation - get relevant data
-                result = self.data_extraction_agent.extract_relevant_data(
-                    input_folder=input_folder,
-                    objective=extraction_objective,
-                    keywords=parameters.get('keywords'),
-                    temp_folder=temp_folder,
-                    max_files=parameters.get('max_files', 15),
-                    max_content_per_file=parameters.get('max_content_per_file', 4000),
-                    max_total_content=parameters.get('max_total_content', 40000),
-                    file_types=parameters.get('file_types')
-                )
-                
-            elif operation == 'search_content':
-                # Search for specific content
-                result = self.data_extraction_agent.search_in_files(
-                    input_folder=input_folder,
-                    search_query=parameters.get('query', extraction_objective),
-                    file_types=parameters.get('file_types'),
-                    max_results=parameters.get('max_results', 10)
-                )
-                
-            elif operation == 'get_file_preview':
-                # Get preview of a specific file
-                file_path = parameters.get('file_path')
-                if file_path:
-                    result = self.data_extraction_agent.get_file_preview(
-                        file_path=file_path,
-                        max_chars=parameters.get('max_chars', 2000)
-                    )
-                else:
-                    result = {"success": False, "error": "No file_path provided"}
-                    
-            elif operation == 'summarize_folder':
-                # Get folder summary
-                result = self.data_extraction_agent.summarize_input_folder(
-                    input_folder=input_folder,
-                    objective=extraction_objective
-                )
-                
-            else:
-                # Default to extract_relevant
-                result = self.data_extraction_agent.extract_relevant_data(
-                    input_folder=input_folder,
-                    objective=extraction_objective,
-                    temp_folder=temp_folder
-                )
+            logger.info(f"[DATA EXTRACTION AGENT] Operation: {operation}")
+            logger.info(f"[DATA EXTRACTION AGENT] Parameters: {parameters}")
+            logger.info("-" * 80)
+            
+            # Create standardized AgentExecutionRequest
+            logger.info(f"[DATA EXTRACTION AGENT] Calling DataExtractionAgent.execute_task() with standardized request...")
+            request: AgentExecutionRequest = {
+                "task_id": task_id,
+                "task_description": task['description'],
+                "task_type": "atomic",
+                "operation": operation,
+                "parameters": parameters,
+                "input_data": parameters,
+                "temp_folder": str(self.config.folders.temp_path),
+                "output_folder": str(self.config.folders.output_path),
+                "cache_enabled": True,
+                "blackboard": cast(list[dict[str, Any]], state.get('blackboard', [])),
+                "relevant_entries": [],
+                "max_retries": 3
+            }
+            
+            # Execute using standardized interface
+            response = cast(AgentExecutionResponse, self.data_extraction_agent.execute_task(request=request))
             
             logger.info(f"[DATA EXTRACTION AGENT] Operation '{operation}' completed")
             
-            # Update task with result
+            # Extract legacy-compatible result_data from standardized response
             result_data = {
                 "operation": operation,
-                "success": result.get('success', True) if result else False,
-                "data": result
+                "success": response['success'],
+                "data": response['result']
             }
             
             updated_task = {
                 **task,
-                "status": TaskStatus.COMPLETED,
+                "status": TaskStatus.COMPLETED if response['success'] else TaskStatus.FAILED,
                 "result": result_data,
                 "updated_at": datetime.now().isoformat()
             }
@@ -1989,6 +2136,7 @@ class TaskManagerAgent:
             ]
             
             # Create blackboard entry with extracted data summary
+            result = response.get('result', {})
             blackboard_entry: BlackboardEntry = {
                 "entry_type": BlackboardType.DATA_POINT,
                 "source_agent": "data_extraction_agent",
@@ -2099,12 +2247,31 @@ class TaskManagerAgent:
         # LangGraph will automatically concatenate with existing lists
         # Only add if not already present and not a BROKEN_DOWN task
         
-        # Handle failed tasks separately - add to failed_task_ids instead of completed_task_ids
+        # Handle failed tasks - route to human review for resolution
         if task_status == TaskStatus.FAILED and not already_failed:
-            logger.warning(f"🔍 [TASK_ID_TRACKER] AGGREGATE RETURN | Adding FAILED task_id='{task_id}' to failed_task_ids | Location: _aggregate_results:1788")
+            # Log the failure details for debugging
+            error_msg = 'No error message provided'
+            if current_task:
+                error_msg = current_task.get('error', 'No error message provided')
+                result = current_task.get('result', {})
+                
+                logger.error("=" * 80)
+                logger.error(f"⚠️  TASK FAILED: {task_id}")
+                logger.error("=" * 80)
+                logger.error(f"Description: {current_task.get('description', 'N/A')[:150]}")
+                logger.error(f"Error: {error_msg}")
+                if isinstance(result, dict):
+                    logger.error(f"Result Success: {result.get('success', 'N/A')}")
+                    logger.error(f"Result Error: {result.get('error', 'N/A')}")
+                logger.error("=" * 80)
+            
+            # Route to human review for failed tasks
+            logger.warning(f"🔍 [TASK_ID_TRACKER] AGGREGATE RETURN | FAILED task_id='{task_id}' requires human review | Location: _aggregate_results:1788")
+            logger.warning(f"[AGGREGATE] Routing FAILED task {task_id} to human review for resolution")
             return {
                 **state,
-                "failed_task_ids": [task_id]  # Add to failed list, not completed list
+                "requires_human_review": True,
+                "human_feedback": f"Task {task_id} failed: {str(error_msg)[:200]}"
             }
         
         # Handle successful task completion (not BROKEN_DOWN, not FAILED)
@@ -2697,7 +2864,12 @@ Respond with JSON:
     
     
     def _handle_error(self, state: AgentState) -> AgentState:
-        """Handle task errors with retry logic."""
+        """
+        Handle task errors with retry logic and LLM-based error analysis.
+        
+        Uses ProblemSolverAgent to analyze errors and potentially suggest solutions
+        before routing to human review.
+        """
         task_id = state['active_task_id']
         
         if not task_id:
@@ -2711,17 +2883,116 @@ Respond with JSON:
         
         logger.warning(f"[ERROR] Handling error for task {task_id}")
         
-        # Mark task as failed in the tasks list
+        # Get the failed task for analysis
+        current_task = next((t for t in state['tasks'] if t['id'] == task_id), None)
+        
+        # Use ProblemSolverAgent to analyze the error and generate solutions
+        error_analysis = None
+        suggested_solutions = None
+        
+        if current_task:
+            try:
+                error_msg = current_task.get('error', 'Task failed during processing')
+                task_description = current_task.get('description', '')
+                task_result = current_task.get('result')
+                task_context = {
+                    'task_id': task_id,
+                    'description': task_description,
+                    'result': task_result,
+                    'metadata': state.get('metadata', {}),
+                    'action': task_result.get('action') if isinstance(task_result, dict) else None
+                }
+                
+                # Determine agent type from the task action
+                agent_type = None
+                if isinstance(task_result, dict):
+                    action = task_result.get('action', '')
+                    if 'excel' in action.lower():
+                        agent_type = 'excel'
+                    elif 'pdf' in action.lower():
+                        agent_type = 'pdf'
+                    elif 'web' in action.lower() or 'search' in action.lower():
+                        agent_type = 'web_search'
+                    elif 'ocr' in action.lower():
+                        agent_type = 'ocr'
+                    elif 'code' in action.lower():
+                        agent_type = 'code'
+                
+                logger.info(f"[ERROR] Analyzing error with ProblemSolverAgent for task {task_id}")
+                
+                # Diagnose the error using standardized interface
+                diagnose_request: AgentExecutionRequest = {
+                    "task_id": f"diagnose_{task_id}",
+                    "task_description": "Diagnose error for task",
+                    "task_type": "atomic",
+                    "operation": "diagnose_error",
+                    "parameters": {
+                        "error_message": str(error_msg),
+                        "task_context": task_context,
+                        "agent_type": agent_type
+                    },
+                    "input_data": {},
+                    "temp_folder": str(self.config.folders.temp_path),
+                    "output_folder": str(self.config.folders.output_path),
+                    "cache_enabled": False,
+                    "blackboard": cast(list[dict[str, Any]], state.get('blackboard', [])),
+                    "relevant_entries": [],
+                    "max_retries": 1
+                }
+                
+                diagnose_response = cast(AgentExecutionResponse, self.problem_solver_agent.execute_task(request=diagnose_request))
+                error_analysis = diagnose_response.get('result', {}) if diagnose_response['success'] else None
+                
+                if error_analysis:
+                    logger.info(f"[ERROR] Error diagnosis: category={error_analysis.get('error_category')}")
+                    logger.info(f"[ERROR] Solution prompt: {error_analysis.get('solution_prompt', 'Unknown')[:100]}...")
+                
+                # Generate solution using standardized interface
+                solution_request: AgentExecutionRequest = {
+                    "task_id": f"solution_{task_id}",
+                    "task_description": "Get solution for task error",
+                    "task_type": "atomic",
+                    "operation": "get_solution",
+                    "parameters": {
+                        "error_message": str(error_msg),
+                        "task_context": task_context,
+                        "agent_type": agent_type
+                    },
+                    "input_data": {},
+                    "temp_folder": str(self.config.folders.temp_path),
+                    "output_folder": str(self.config.folders.output_path),
+                    "cache_enabled": False,
+                    "blackboard": cast(list[dict[str, Any]], state.get('blackboard', [])),
+                    "relevant_entries": [],
+                    "max_retries": 1
+                }
+                
+                solution_response = cast(AgentExecutionResponse, self.problem_solver_agent.execute_task(request=solution_request))
+                suggested_solutions = solution_response.get('result', {}) if solution_response['success'] else None
+                
+                if suggested_solutions:
+                    logger.info(f"[ERROR] Solution type: {suggested_solutions.get('solution_type')}")
+                    logger.info(f"[ERROR] Suggested action: {suggested_solutions.get('suggested_action', 'N/A')[:80]}...")
+                        
+            except Exception as e:
+                logger.warning(f"[ERROR] ProblemSolverAgent analysis failed: {str(e)}")
+                logger.exception(e)
+        
+        # Mark task as failed in the tasks list with enhanced error info
         updated_tasks = []
         for task in state['tasks']:
             if task['id'] == task_id:
                 task['status'] = TaskStatus.FAILED
-                task['result'] = {'error': 'Task failed during processing'}
+                task['result'] = {
+                    'error': task.get('error', 'Task failed during processing'),
+                    'error_analysis': error_analysis,
+                    'suggested_solutions': suggested_solutions
+                }
                 updated_tasks.append(task)
             else:
                 updated_tasks.append(task)
         
-        logger.warning(f"[ERROR] Task {task_id} marked as failed")
+        logger.warning(f"[ERROR] Task {task_id} marked as failed with error analysis")
         
         # NOTE: failed_task_ids uses operator.add annotation, so only return NEW items to add
         return {
@@ -2734,75 +3005,115 @@ Respond with JSON:
     
     
     def _request_human_review(self, state: AgentState) -> AgentState:
-        """Request human review for complex decisions - Try websearch first"""
+        """
+        Request human review for failed tasks or complex decisions.
+        
+        Uses ProblemSolverAgent for:
+        - Displaying error analysis and suggested solutions
+        - Interpreting natural language human input into structured format
+        
+        For failed tasks, provides three options:
+        1. Restart task with updated user input/context
+        2. Provide human input as task output (for dependent tasks)
+        3. Ignore/skip the failed task
+        """
         logger.warning("!"*60)
         logger.warning("HUMAN REVIEW REQUIRED")
         logger.warning("!"*60)
-        logger.warning("The agent needs human input to proceed.")
         
         task_id = state.get('active_task_id')
         current_task = None
+        is_failed_task = False
+        error_analysis = None
+        suggested_solutions = None
+        
         if task_id:
             task = next((t for t in state.get('tasks', []) if t['id'] == task_id), None)
             if task:
                 current_task = task
+                is_failed_task = task.get('status') == TaskStatus.FAILED
                 logger.warning(f"Active task: {task_id}")
                 logger.warning(f"Task description: {task.get('description', 'N/A')[:100]}...")
+                logger.warning(f"Task status: {task.get('status')}")
+                if is_failed_task:
+                    logger.warning(f"Task error: {task.get('error', 'Unknown error')}")
+                    # Extract error analysis from task result if available
+                    result = task.get('result', {})
+                    if isinstance(result, dict):
+                        error_analysis = result.get('error_analysis')
+                        suggested_solutions = result.get('suggested_solutions')
                 if task.get('result'):
                     logger.warning(f"Analysis result: {task.get('result')}")
         
         logger.warning("!"*60)
         
-        # Try websearch first
-        if self.config.enable_search and current_task:
-            logger.info("Attempting to search for task information...")
-            try:
-                from langchain_community.tools import DuckDuckGoSearchRun
-                search = DuckDuckGoSearchRun()
-                search_query = current_task.get('description', '')[:100]
-                result = search.run(search_query)
-                
-                if result and len(result.strip()) > 0:
-                    logger.info("Search results found. Proceeding with execution using search data...")
-                    # Add search results to task metadata
-                    updated_state: AgentState = dict(state)  # type: ignore
-                    updated_state['metadata'] = {
-                        **state.get('metadata', {}),
-                        'search_results': result,
-                        'search_performed': True
-                    }
-                    return updated_state
-            except Exception as e:
-                logger.debug(f"Web search attempt failed: {str(e)}. Proceeding to human input...")
-        
-        # Interactive human review if search didn't help
+        # Interactive human review
         print()
         print("=" * 70)
-        print("HUMAN REVIEW REQUIRED")
+        if is_failed_task:
+            print("FAILED TASK - HUMAN REVIEW REQUIRED")
+        else:
+            print("HUMAN REVIEW REQUIRED")
         print("=" * 70)
         
         if current_task:
             print()
-            print(f"Task: {current_task.get('description', 'Unknown')[:100]}")
+            print(f"Task ID: {task_id}")
+            print(f"Task: {current_task.get('description', 'Unknown')}")
+            
+            if is_failed_task:
+                error = current_task.get('error', 'Unknown error')
+                print(f"\n❌ FAILURE REASON: {error}")
+                result = current_task.get('result', {})
+                if isinstance(result, dict) and result.get('error'):
+                    print(f"   Details: {result.get('error')}")
+                
+                # Display AI error diagnosis if available
+                if error_analysis:
+                    print()
+                    print("🤖 AI ERROR DIAGNOSIS:")
+                    print(f"   Category: {error_analysis.get('error_category', 'Unknown')}")
+                    print(f"   Solution Hint: {error_analysis.get('solution_prompt', 'Unknown')[:80]}...")
+                
+                # Display suggested solutions if available
+                if suggested_solutions:
+                    print()
+                    print("💡 SUGGESTED SOLUTION:")
+                    print(f"   Type: {suggested_solutions.get('solution_type', 'N/A')}")
+                    print(f"   Action: {suggested_solutions.get('suggested_action', 'N/A')[:70]}...")
+                    print(f"   Confidence: {suggested_solutions.get('confidence', 'N/A')}")
+                    if suggested_solutions.get('requires_human_input'):
+                        print(f"   Human Input Needed: {suggested_solutions.get('human_input_prompt', 'Please provide additional information')[:60]}...")
+                    if suggested_solutions.get('alternative_approaches'):
+                        print("   Alternatives:")
+                        for i, alt in enumerate(suggested_solutions.get('alternative_approaches', [])[:2], 1):
+                            print(f"     {i}. {alt[:60]}...")
             
             result = current_task.get('result')
-            if result:
+            if result and not is_failed_task:
                 if isinstance(result, dict):
                     print()
                     print("Analysis Result:")
                     for key, value in result.items():
-                        if key != 'subtasks':
+                        if key not in ['subtasks', 'error_analysis', 'suggested_solutions']:
                             print(f"  {key}: {str(value)[:80]}")
-                        else:
+                        elif key == 'subtasks':
                             if isinstance(value, list):
                                 print(f"  {key}: {len(value)} subtasks created")
         
         print()
-        print("Options:")
-        print("  1. Continue with execution")
-        print("  2. Provide additional guidance")
-        print("  3. Skip this task")
-        print("  4. Abort")
+        if is_failed_task:
+            print("Options for Failed Task:")
+            print("  1. Restart task with updated context/input")
+            print("  2. Provide manual output (use your input as task result)")
+            print("  3. Ignore and continue (mark as skipped)")
+            print("  4. Abort workflow")
+        else:
+            print("Options:")
+            print("  1. Continue with execution")
+            print("  2. Provide additional guidance")
+            print("  3. Skip this task")
+            print("  4. Abort workflow")
         print()
         
         updated_state: AgentState = dict(state)  # type: ignore
@@ -2810,40 +3121,296 @@ Respond with JSON:
         while True:
             choice = input("Enter your choice (1-4): ").strip()
             
-            # Update state based on choice
-            
             if choice == "1":
-                print()
-                print("Proceeding with execution...")
-                break
+                if is_failed_task:
+                    # Option 1: Restart task with updated context
+                    print()
+                    print("Provide updated context/input for task retry:")
+                    print("(Enter multiple lines, type 'DONE' on a new line when finished)")
+                    print("(Your input will be interpreted by AI for optimal formatting)")
+                    lines = []
+                    while True:
+                        line = input()
+                        if line.strip().upper() == 'DONE':
+                            break
+                        lines.append(line)
+                    
+                    raw_input = '\n'.join(lines).strip()
+                    
+                    if raw_input:
+                        logger.info(f"[HUMAN REVIEW] Processing human input for task {task_id}")
+                        
+                        # Use ProblemSolverAgent to interpret and format human input
+                        try:
+                            # Get agent type from task result
+                            agent_type = None
+                            action = ''
+                            if current_task:
+                                task_result = current_task.get('result')
+                                if isinstance(task_result, dict):
+                                    action = task_result.get('action', '')
+                                    if 'excel' in action.lower():
+                                        agent_type = 'excel'
+                                    elif 'pdf' in action.lower():
+                                        agent_type = 'pdf'
+                                    elif 'web' in action.lower() or 'search' in action.lower():
+                                        agent_type = 'web_search'
+                                    elif 'ocr' in action.lower():
+                                        agent_type = 'ocr'
+                                    elif 'code' in action.lower():
+                                        agent_type = 'code'
+                            
+                            # Interpret the human input using standardized interface
+                            interpret_request: AgentExecutionRequest = {
+                                "task_id": f"interpret_{task_id}",
+                                "task_description": "Interpret human input",
+                                "task_type": "atomic",
+                                "operation": "interpret_human_input",
+                                "parameters": {
+                                    "human_input": raw_input,
+                                    "target_format": agent_type or 'json',
+                                    "task_context": {
+                                        'task_id': task_id,
+                                        'task_description': current_task.get('description') if current_task else '',
+                                        'error': current_task.get('error') if current_task else None,
+                                        'original_action': action if agent_type else None
+                                    }
+                                },
+                                "input_data": {"human_input": raw_input},
+                                "temp_folder": str(self.config.folders.temp_path),
+                                "output_folder": str(self.config.folders.output_path),
+                                "cache_enabled": True,
+                                "blackboard": cast(list[dict[str, Any]], state.get('blackboard', [])),
+                                "relevant_entries": [],
+                                "max_retries": 2
+                            }
+                            interpret_response = cast(AgentExecutionResponse, self.problem_solver_agent.execute_task(request=interpret_request))
+                            interpreted = interpret_response.get('result', {}) if interpret_response['success'] else None
+                            
+                            if interpreted and interpreted.get('success'):
+                                logger.info(f"[HUMAN REVIEW] Interpreted input: confidence={interpreted.get('confidence')}")
+                                
+                                # Format for the specific agent if applicable
+                                if agent_type:
+                                    task_result = current_task.get('result', {}) if current_task else {}
+                                    operation = task_result.get('operation') if isinstance(task_result, dict) else None
+                                    format_request: AgentExecutionRequest = {
+                                        "task_id": f"format_{task_id}",
+                                        "task_description": "Format data for agent",
+                                        "task_type": "atomic",
+                                        "operation": "format_for_agent",
+                                        "parameters": {
+                                            "data": interpreted.get('parsed_data', raw_input),
+                                            "agent_type": agent_type,
+                                            "operation": operation
+                                        },
+                                        "input_data": {"data": interpreted.get('parsed_data', raw_input)},
+                                        "temp_folder": str(self.config.folders.temp_path),
+                                        "output_folder": str(self.config.folders.output_path),
+                                        "cache_enabled": True,
+                                        "blackboard": cast(list[dict[str, Any]], state.get('blackboard', [])),
+                                        "relevant_entries": [],
+                                        "max_retries": 2
+                                    }
+                                    format_response = cast(AgentExecutionResponse, self.problem_solver_agent.execute_task(request=format_request))
+                                    formatted = format_response.get('result', {}) if format_response['success'] else interpreted.get('parsed_data', raw_input)
+                                    updated_context = json.dumps(formatted) if isinstance(formatted, dict) else str(formatted)
+                                    logger.info(f"[HUMAN REVIEW] Formatted for {agent_type} agent")
+                                else:
+                                    updated_context = interpreted.get('parsed_data', raw_input)
+                                    if isinstance(updated_context, dict):
+                                        updated_context = json.dumps(updated_context)
+                                
+                                print(f"🤖 AI interpreted your input (confidence: {interpreted.get('confidence', 'N/A')})")
+                            else:
+                                updated_context = raw_input
+                                logger.info(f"[HUMAN REVIEW] Using raw input (interpretation unavailable)")
+                                
+                        except Exception as e:
+                            logger.warning(f"[HUMAN REVIEW] Input interpretation failed: {str(e)}, using raw input")
+                            updated_context = raw_input
+                        
+                        logger.info(f"[HUMAN REVIEW] Restarting task {task_id} with updated context")
+                        
+                        # Reset task to PENDING status with updated context
+                        updated_tasks = []
+                        for t in state['tasks']:
+                            if t['id'] == task_id:
+                                updated_task = {
+                                    **t,
+                                    "status": TaskStatus.PENDING,
+                                    "error": None,
+                                    "human_context": updated_context,
+                                    "human_raw_input": raw_input,
+                                    "retry_count": t.get('retry_count', 0) + 1,
+                                    "updated_at": datetime.now().isoformat()
+                                }
+                                updated_tasks.append(updated_task)
+                                logger.info(f"[HUMAN REVIEW] Task {task_id} reset to PENDING with new context (retry #{updated_task['retry_count']})")
+                            else:
+                                updated_tasks.append(t)
+                        
+                        # Update metadata with human context
+                        updated_state['tasks'] = updated_tasks  # type: ignore
+                        updated_state['metadata'] = {
+                            **state.get('metadata', {}),
+                            f'human_context_{task_id}': updated_context,
+                            f'human_raw_input_{task_id}': raw_input
+                        }
+                        updated_state['requires_human_review'] = False
+                        
+                        print(f"✓ Task {task_id} will be retried with your context")
+                        break
+                    else:
+                        print("No context provided. Please try again or choose another option.")
+                        continue
+                else:
+                    # Normal flow: continue with execution
+                    print()
+                    print("Proceeding with execution...")
+                    updated_state['requires_human_review'] = False
+                    break
                 
             elif choice == "2":
-                print()
-                guidance = input("Provide guidance (e.g., data sources, specific requirements): ").strip()
-                if guidance:
-                    updated_state['metadata'] = {**state.get('metadata', {}), 'human_guidance': guidance}
-                    print("Guidance recorded. Continuing...")
-                    break
+                if is_failed_task:
+                    # Option 2: Provide manual output as task result
+                    print()
+                    print("Provide the output/result for this task:")
+                    print("(This will be used as the task's result for dependent tasks)")
+                    print("(Enter multiple lines, type 'DONE' on a new line when finished)")
+                    print("(Your input will be interpreted by AI for optimal formatting)")
+                    lines = []
+                    while True:
+                        line = input()
+                        if line.strip().upper() == 'DONE':
+                            break
+                        lines.append(line)
+                    
+                    raw_output = '\n'.join(lines).strip()
+                    
+                    if raw_output:
+                        logger.info(f"[HUMAN REVIEW] Processing manual output for task {task_id}")
+                        
+                        # Use ProblemSolverAgent to interpret and format the output
+                        formatted_output = raw_output
+                        try:
+                            interpret_output_request: AgentExecutionRequest = {
+                                "task_id": f"interpret_output_{task_id}",
+                                "task_description": "Interpret human output",
+                                "task_type": "atomic",
+                                "operation": "interpret_human_input",
+                                "parameters": {
+                                    "human_input": raw_output,
+                                    "target_format": 'json',
+                                    "task_context": {
+                                        'task_id': task_id,
+                                        'task_description': current_task.get('description') if current_task else '',
+                                        'purpose': 'task_output',
+                                        'for_dependent_tasks': True
+                                    }
+                                },
+                                "input_data": {"human_input": raw_output},
+                                "temp_folder": str(self.config.folders.temp_path),
+                                "output_folder": str(self.config.folders.output_path),
+                                "cache_enabled": True,
+                                "blackboard": cast(list[dict[str, Any]], state.get('blackboard', [])),
+                                "relevant_entries": [],
+                                "max_retries": 2
+                            }
+                            interpret_output_response = cast(AgentExecutionResponse, self.problem_solver_agent.execute_task(request=interpret_output_request))
+                            interpreted = interpret_output_response.get('result', {}) if interpret_output_response['success'] else None
+                            
+                            if interpreted and interpreted.get('success'):
+                                formatted_output = interpreted.get('parsed_data', raw_output)
+                                if isinstance(formatted_output, dict):
+                                    # Keep as dict for structured output
+                                    logger.info(f"[HUMAN REVIEW] Output interpreted as structured data")
+                                    print(f"🤖 AI interpreted your output (confidence: {interpreted.get('confidence', 'N/A')})")
+                                else:
+                                    formatted_output = str(formatted_output)
+                        except Exception as e:
+                            logger.warning(f"[HUMAN REVIEW] Output interpretation failed: {str(e)}, using raw output")
+                            formatted_output = raw_output
+                        
+                        logger.info(f"[HUMAN REVIEW] Using manual output for task {task_id}")
+                        
+                        # Mark task as COMPLETED with human-provided output
+                        updated_tasks = []
+                        for t in state['tasks']:
+                            if t['id'] == task_id:
+                                updated_task = {
+                                    **t,
+                                    "status": TaskStatus.COMPLETED,
+                                    "error": None,
+                                    "result": {
+                                        "success": True,
+                                        "output": formatted_output,
+                                        "raw_output": raw_output,
+                                        "human_provided": True,
+                                        "original_error": t.get('error', 'Unknown')
+                                    },
+                                    "updated_at": datetime.now().isoformat()
+                                }
+                                updated_tasks.append(updated_task)
+                                logger.info(f"[HUMAN REVIEW] Task {task_id} marked as COMPLETED with human output")
+                            else:
+                                updated_tasks.append(t)
+                        
+                        # Add to completed tasks and update results
+                        updated_state['tasks'] = updated_tasks  # type: ignore
+                        updated_state['results'] = {
+                            **state.get('results', {}),
+                            task_id: {
+                                "success": True,
+                                "output": formatted_output,
+                                "raw_output": raw_output,
+                                "human_provided": True
+                            }
+                        }
+                        updated_state['completed_task_ids'] = [task_id]
+                        updated_state['requires_human_review'] = False
+                        
+                        print(f"✓ Task {task_id} marked as completed with your output")
+                        print("  Dependent tasks can now use this result")
+                        break
+                    else:
+                        print("No output provided. Please try again or choose another option.")
+                        continue
                 else:
-                    print("No guidance provided. Please try again or choose another option.")
-                    continue
+                    # Normal flow: provide guidance
+                    print()
+                    guidance = input("Provide guidance (e.g., data sources, specific requirements): ").strip()
+                    if guidance:
+                        updated_state['metadata'] = {**state.get('metadata', {}), 'human_guidance': guidance}
+                        updated_state['requires_human_review'] = False
+                        print("Guidance recorded. Continuing...")
+                        break
+                    else:
+                        print("No guidance provided. Please try again or choose another option.")
+                        continue
                 
             elif choice == "3":
+                # Option 3: Ignore/skip the task
                 print()
-                print("Skipping this task...")
+                if is_failed_task:
+                    print("Ignoring failed task and continuing...")
+                    logger.info(f"[HUMAN REVIEW] Ignoring failed task {task_id}")
+                else:
+                    print("Skipping this task...")
+                    logger.info(f"[HUMAN REVIEW] Skipping task {task_id}")
+                
                 if task_id:
-                    completed = set(state.get('completed_task_ids', []))
-                    if task_id not in completed:
-                        # TRACKING: Log task ID addition for debugging
-                        logger.warning(f"🔍 [TASK_ID_TRACKER] HUMAN_REVIEW adding task_id='{task_id}' (user skip) | Current list size: {len(state.get('completed_task_ids', []))} | Location: _request_human_review:2302")
-                        # NOTE: completed_task_ids uses operator.add annotation
-                        # Only return NEW task IDs, NOT the full list - LangGraph concatenates
-                        updated_state['completed_task_ids'] = [task_id]
+                    # Add to failed_task_ids to mark as handled
+                    logger.warning(f"🔍 [TASK_ID_TRACKER] HUMAN_REVIEW adding task_id='{task_id}' to failed (user ignore) | Location: _request_human_review")
+                    updated_state['failed_task_ids'] = [task_id]
+                    updated_state['requires_human_review'] = False
                 break
                 
             elif choice == "4":
+                # Option 4: Abort workflow
                 print()
                 print("Aborting execution...")
+                logger.warning(f"[HUMAN REVIEW] User aborted workflow")
                 # Mark all remaining tasks as completed to end workflow
                 all_tasks = state.get('tasks', [])
                 completed = set(state.get('completed_task_ids', []))
@@ -2851,19 +3418,20 @@ Respond with JSON:
                 for task in all_tasks:
                     if task['id'] not in completed:
                         tasks_to_add.append(task['id'])
-                # TRACKING: Log task ID addition for debugging
-                logger.warning(f"🔍 [TASK_ID_TRACKER] HUMAN_REVIEW adding {len(tasks_to_add)} task_ids (abort all) | Tasks: {tasks_to_add} | Current list size: {len(state.get('completed_task_ids', []))} | Location: _request_human_review:2322")
-                # NOTE: completed_task_ids uses operator.add annotation
-                # Only return NEW task IDs, NOT the full list - LangGraph concatenates
+                logger.warning(f"🔍 [TASK_ID_TRACKER] HUMAN_REVIEW adding {len(tasks_to_add)} task_ids (abort all) | Tasks: {tasks_to_add} | Location: _request_human_review")
                 updated_state['completed_task_ids'] = tasks_to_add
+                updated_state['requires_human_review'] = False
                 break
             
             else:
                 print()
                 print("Invalid choice. Please enter 1-4.")
-                continue
         
-        return updated_state  # type: ignore
+        print()
+        print("=" * 70)
+        print()
+        
+        return updated_state
     
     
     # ========================================================================
@@ -3303,30 +3871,50 @@ Respond with JSON:
         """
         from langchain_core.runnables.config import RunnableConfig
         
+        # Calculate recursion limit: each task iteration involves ~6 graph nodes
+        # For safety, use max_iterations * 10 to accommodate complex workflows
+        recursion_limit = max(self.config.max_iterations * 10, 5000)
+        
         config: RunnableConfig = {
             "configurable": {"thread_id": thread_id},
-            "recursion_limit": self.config.max_iterations + 100  # Set high limit to allow workflow to continue
+            "recursion_limit": recursion_limit
         }
         
         logger.info(f"Starting Task Manager Agent")
         logger.info(f"Thread ID: {thread_id}")
-        logger.info(f"Recursion limit set to: {self.config.max_iterations + 100}")
+        logger.info(f"Max Task Iterations: {self.config.max_iterations}")
+        logger.info(f"LangGraph Recursion Limit: {recursion_limit} (allows ~{recursion_limit // 6} graph cycles)")
+        logger.warning(f"⚠️  Note: LangGraph counts EVERY node execution, not just task iterations")
         
         final_state: AgentState = self.initial_state
         
         try:
             stream_count = 0
+            last_node_name = "NONE"
             for state in self.app.stream(self.initial_state, config):
                 stream_count += 1
                 # state is a dict with node name as key
                 try:
                     node_name = list(state.keys())[0]
+                    last_node_name = node_name
                     logger.info(f"🔷 GRAPH NODE EXECUTED: {node_name}")
                     print(f"🔷 GRAPH NODE EXECUTED: {node_name}", flush=True)  # Also print to stdout with flush
                     
                     result = list(state.values())[0]
                     if isinstance(result, dict):
                         final_state = result  # type: ignore
+                        
+                        # Log current progress after each node
+                        iteration = final_state.get('iteration_count', 0)
+                        total_tasks = len(final_state.get('tasks', []))
+                        completed = len(set(final_state.get('completed_task_ids', [])))
+                        failed = len(set(final_state.get('failed_task_ids', [])))
+                        logger.debug(f"[PROGRESS] Iter {iteration}/{self.config.max_iterations} | Tasks: {total_tasks} | Completed: {completed} | Failed: {failed}")
+                        
+                    # Check if we're approaching recursion limit
+                    if stream_count % 100 == 0:
+                        logger.warning(f"⚠️  Graph nodes executed: {stream_count}/{recursion_limit}")
+                        
                 except Exception as e:
                     logger.error(f"Error processing state update: {str(e)}")
                     logger.exception(e)
@@ -3334,7 +3922,9 @@ Respond with JSON:
             
             # If we exit the loop normally, log it
             logger.info(f"🔷 GRAPH STREAM ENDED NORMALLY after {stream_count} nodes")
+            logger.info(f"🔷 LAST NODE EXECUTED: {last_node_name}")
             print(f"🔷 GRAPH STREAM ENDED NORMALLY after {stream_count} nodes", flush=True)
+            print(f"🔷 LAST NODE EXECUTED: {last_node_name}", flush=True)
                     
         except StopIteration:
             logger.info("🔷 GRAPH STREAM STOPPED (StopIteration)")
@@ -3345,17 +3935,34 @@ Respond with JSON:
         except KeyboardInterrupt:
             logger.warning("🔷 GRAPH STREAM INTERRUPTED BY USER")
             print("🔷 GRAPH STREAM INTERRUPTED BY USER", flush=True)
+            raise  # Re-raise to allow proper cleanup
         except Exception as e:
-            logger.error("=" * 80)
-            logger.error("🚨 CRITICAL ERROR IN WORKFLOW EXECUTION")
-            logger.error("=" * 80)
-            logger.error(f"Exception Type: {type(e).__name__}")
-            logger.error(f"Exception: {str(e)}")
-            logger.exception(e)
-            logger.error("=" * 80)
-            logger.error("Workflow terminated unexpectedly. Returning last known state.")
-            logger.error("=" * 80)
-            print(f"🚨 CRITICAL ERROR: {type(e).__name__}: {str(e)}", flush=True)
+            # Check for recursion limit errors
+            error_str = str(e).lower()
+            if "recursion" in error_str or "maximum" in error_str:
+                logger.error("=" * 80)
+                logger.error("🚨 LANGGRAPH RECURSION LIMIT EXCEEDED")
+                logger.error("=" * 80)
+                logger.error(f"Graph nodes executed: {stream_count}")
+                logger.error(f"Recursion limit: {recursion_limit}")
+                logger.error(f"Task iterations: {final_state.get('iteration_count', 0)}")
+                logger.error("=" * 80)
+                logger.error("SOLUTION: The workflow involves too many graph nodes.")
+                logger.error("Each task iteration uses ~6 graph nodes (select → analyze → execute → aggregate → check).")
+                logger.error(f"Consider reducing max_iterations or simplifying task breakdown.")
+                logger.error("=" * 80)
+                print(f"🚨 RECURSION LIMIT EXCEEDED: {stream_count} nodes / {recursion_limit} limit", flush=True)
+            else:
+                logger.error("=" * 80)
+                logger.error("🚨 CRITICAL ERROR IN WORKFLOW EXECUTION")
+                logger.error("=" * 80)
+                logger.error(f"Exception Type: {type(e).__name__}")
+                logger.error(f"Exception: {str(e)}")
+                logger.exception(e)
+                logger.error("=" * 80)
+                logger.error("Workflow terminated unexpectedly. Returning last known state.")
+                logger.error("=" * 80)
+                print(f"🚨 CRITICAL ERROR: {type(e).__name__}: {str(e)}", flush=True)
         
         # Log final task hierarchy summary
         logger.info("")

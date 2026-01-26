@@ -7,14 +7,32 @@ Capabilities:
 - Merge multiple PDF files
 - Extract specific pages from PDFs
 - Add metadata and annotations
+
+Migration Status:
+- Week 8 Day 1: ✅ COMPLETED - Legacy support removed, standardized-only interface
 """
 
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 from datetime import datetime
 import json
+import time
 
 from task_manager.utils.logger import get_logger
+
+# Import standardized schemas and utilities (Week 1-2 implementation)
+from task_manager.models import (
+    AgentExecutionRequest,
+    AgentExecutionResponse,
+    create_system_event,
+    create_error_response
+)
+from task_manager.utils import (
+    auto_convert_response,
+    validate_agent_execution_response,
+    exception_to_error_response
+)
+from task_manager.core.event_bus import get_event_bus
 
 logger = get_logger(__name__)
 
@@ -32,7 +50,8 @@ class PDFAgent:
     """
     
     def __init__(self):
-        """Initialize PDF Agent."""
+        """Initialize PDF Agent with dual-format support."""
+        self.agent_name = "pdf_agent"
         self.supported_operations = [
             "read",
             "create",
@@ -41,7 +60,11 @@ class PDFAgent:
             "add_metadata",
             "extract_text"
         ]
-        logger.info("PDF Agent initialized")
+        
+        # Initialize event bus for event-driven workflows
+        self.event_bus = get_event_bus()
+        
+        logger.info("PDF Agent initialized with dual-format support")
         self._check_dependencies()
     
     
@@ -535,55 +558,185 @@ class PDFAgent:
             }
     
     
-    def execute_task(
-        self,
-        operation: str,
-        parameters: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    def execute_task(self, request: AgentExecutionRequest) -> AgentExecutionResponse:
         """
-        Execute a PDF operation based on operation type.
+        Execute a PDF operation using standardized interface.
         
         Args:
-            operation: Type of operation (read, create, merge, extract_pages)
-            parameters: Operation parameters
+            request: AgentExecutionRequest with operation and parameters
         
         Returns:
-            Result dictionary
+            AgentExecutionResponse: Standardized response
         """
-        logger.info(f"Executing PDF operation: {operation}")
+        start_time = time.time()
         
-        if operation == "read":
-            return self.read_pdf(
-                file_path=parameters.get('file_path', ''),
-                extract_text=parameters.get('extract_text', True),
-                extract_tables=parameters.get('extract_tables', False),
-                page_range=parameters.get('page_range')
+        try:
+            # Extract request parameters
+            task_id = request.get("task_id", f"pdf_{int(time.time())}")
+            operation = request.get("operation", "unknown")
+            parameters = request.get("parameters", {})
+            
+            logger.info(f"[{self.agent_name}] Executing operation: {operation} (task_id={task_id})")
+            
+            # Execute the operation using existing methods
+            if operation == "read":
+                result = self.read_pdf(
+                    file_path=parameters.get('file_path', ''),
+                    extract_text=parameters.get('extract_text', True),
+                    extract_tables=parameters.get('extract_tables', False),
+                    page_range=parameters.get('page_range')
+                )
+            
+            elif operation == "create":
+                result = self.create_pdf(
+                    output_path=parameters.get('output_path', ''),
+                    content=parameters.get('content', []),
+                    title=parameters.get('title'),
+                    author=parameters.get('author')
+                )
+            
+            elif operation == "merge":
+                result = self.merge_pdfs(
+                    input_files=parameters.get('input_files', []),
+                    output_path=parameters.get('output_path', '')
+                )
+            
+            elif operation == "extract_pages":
+                result = self.extract_pages(
+                    input_path=parameters.get('input_path', ''),
+                    page_numbers=parameters.get('page_numbers', []),
+                    output_path=parameters.get('output_path', '')
+                )
+            
+            else:
+                result = {
+                    "success": False,
+                    "error": f"Unknown operation: {operation}",
+                    "supported_operations": self.supported_operations
+                }
+            
+            # Convert legacy result to standardized response
+            standard_response = self._convert_to_standard_response(
+                result,
+                operation,
+                task_id,
+                start_time
             )
+            
+            # Publish completion event for event-driven workflows
+            self._publish_completion_event(task_id, operation, standard_response)
+            
+            return standard_response
         
-        elif operation == "create":
-            return self.create_pdf(
-                output_path=parameters.get('output_path', ''),
-                content=parameters.get('content', []),
-                title=parameters.get('title'),
-                author=parameters.get('author')
+        except Exception as e:
+            logger.error(f"[{self.agent_name}] Error executing task: {e}", exc_info=True)
+            
+            # Create standardized error response
+            error = exception_to_error_response(
+                e,
+                source=self.agent_name,
+                task_id=request.get("task_id", "unknown")
             )
-        
-        elif operation == "merge":
-            return self.merge_pdfs(
-                input_files=parameters.get('input_files', []),
-                output_path=parameters.get('output_path', '')
-            )
-        
-        elif operation == "extract_pages":
-            return self.extract_pages(
-                input_path=parameters.get('input_path', ''),
-                page_numbers=parameters.get('page_numbers', []),
-                output_path=parameters.get('output_path', '')
-            )
-        
-        else:
-            return {
+            
+            error_response: AgentExecutionResponse = {
+                "status": "failure",
                 "success": False,
-                "error": f"Unknown operation: {operation}",
-                "supported_operations": self.supported_operations
+                "result": {},
+                "artifacts": [],
+                "execution_time_ms": int((time.time() - start_time) * 1000),
+                "timestamp": datetime.now().isoformat(),
+                "agent_name": self.agent_name,
+                "operation": request.get("operation", "unknown"),
+                "blackboard_entries": [],
+                "warnings": []
             }
+            # Add error field separately to handle TypedDict
+            error_response["error"] = error  # type: ignore
+            
+            return error_response
+    
+    def _convert_to_standard_response(
+        self,
+        legacy_result: Dict[str, Any],
+        operation: str,
+        task_id: str,
+        start_time: float
+    ) -> AgentExecutionResponse:
+        """Convert legacy result dict to standardized AgentExecutionResponse."""
+        success = legacy_result.get("success", False)
+        
+        # Extract artifacts from result
+        artifacts = []
+        output_file = legacy_result.get("file") or legacy_result.get("output_path")
+        if output_file and success:
+            file_path = Path(output_file)
+            if file_path.exists():
+                artifacts.append({
+                    "type": "pdf",
+                    "path": str(output_file),
+                    "size_bytes": file_path.stat().st_size,
+                    "description": f"PDF output from {operation} operation"
+                })
+        
+        # Create blackboard entries for sharing data
+        blackboard_entries = []
+        if success and "text_content" in legacy_result:
+            blackboard_entries.append({
+                "key": f"pdf_text_{task_id}",
+                "value": legacy_result.get("extracted_data", ""),
+                "scope": "workflow",
+                "ttl_seconds": 3600
+            })
+        
+        # Build standardized response
+        response: AgentExecutionResponse = {
+            "status": "success" if success else "failure",
+            "success": success,
+            "result": {
+                k: v for k, v in legacy_result.items()
+                if k not in ["success", "file", "output_path"]
+            },
+            "artifacts": artifacts,
+            "execution_time_ms": int((time.time() - start_time) * 1000),
+            "timestamp": datetime.now().isoformat(),
+            "agent_name": self.agent_name,
+            "operation": operation,
+            "blackboard_entries": blackboard_entries,
+            "warnings": []
+        }
+        
+        # Add error field if present (handle TypedDict)
+        if not success and "error" in legacy_result:
+            response["error"] = create_error_response(  # type: ignore
+                error_code="PDF_001",
+                error_type="execution_error",
+                message=legacy_result.get("error", "Unknown error"),
+                source=self.agent_name
+            )
+        
+        return response
+    
+    def _publish_completion_event(
+        self,
+        task_id: str,
+        operation: str,
+        response: AgentExecutionResponse
+    ):
+        """Publish task completion event for event-driven workflows."""
+        try:
+            event = create_system_event(
+                event_type="pdf_extraction_completed" if operation == "read" else "pdf_operation_completed",
+                event_category="task_lifecycle",
+                source_agent=self.agent_name,
+                payload={
+                    "task_id": task_id,
+                    "operation": operation,
+                    "success": response["success"],
+                    "artifacts": response["artifacts"],
+                    "blackboard_keys": [entry["key"] for entry in response["blackboard_entries"]]
+                }
+            )
+            self.event_bus.publish(event)
+            logger.debug(f"Published completion event for task {task_id}")
+        except Exception as e:
+            logger.warning(f"Failed to publish completion event: {e}")

@@ -26,6 +26,12 @@ from typing import Optional, Union, List, Dict, Any
 from dotenv import load_dotenv
 
 from .rate_limiter import global_rate_limiter
+from .exceptions import (
+    ConfigurationError,
+    MissingDependencyError,
+    LLMError,
+    InvalidParameterError
+)
 
 logger = logging.getLogger(__name__)
 
@@ -140,8 +146,9 @@ class LLMClient:
         
         # Validate provider
         if self.provider not in self.PROVIDER_DEFAULTS:
-            raise ValueError(
-                f"Unsupported provider: {self.provider}. "
+            raise InvalidParameterError(
+                parameter_name="provider",
+                message=f"Unsupported provider: {self.provider}. "
                 f"Supported: {list(self.PROVIDER_DEFAULTS.keys())}"
             )
         
@@ -164,8 +171,9 @@ class LLMClient:
         
         # Validate API key
         if not self.api_key:
-            raise ValueError(
-                f"API key not found. Set LLM_API_KEY environment variable or pass api_key parameter."
+            raise ConfigurationError(
+                setting_name="LLM_API_KEY",
+                message="API key not found. Set LLM_API_KEY environment variable or pass api_key parameter."
             )
         
         logger.info(f"Initializing LLM Client")
@@ -207,9 +215,10 @@ class LLMClient:
             logger.info(f"  Model: {self.model}")
             
         except ImportError:
-            raise ImportError(
-                "google-generativeai SDK not installed. "
-                "Install with: pip install google-generativeai"
+            raise MissingDependencyError(
+                package_name="google-generativeai",
+                install_command="pip install google-generativeai",
+                purpose="Google GenAI SDK"
             )
     
     
@@ -228,7 +237,10 @@ class LLMClient:
         elif self.provider == 'ollama':
             self._init_langchain_ollama()
         else:
-            raise ValueError(f"Unsupported provider: {self.provider}")
+            raise InvalidParameterError(
+                parameter_name="provider",
+                message=f"Unsupported provider: {self.provider}"
+            )
     
     
     def _init_langchain_google(self):
@@ -246,9 +258,10 @@ class LLMClient:
             logger.info(f"  Model: {self.model}")
             
         except ImportError:
-            raise ImportError(
-                "langchain-google-genai not installed. "
-                "Install with: pip install langchain-google-genai"
+            raise MissingDependencyError(
+                package_name="langchain-google-genai",
+                install_command="pip install langchain-google-genai",
+                purpose="LangChain Google wrapper"
             )
     
     
@@ -267,9 +280,10 @@ class LLMClient:
             logger.info(f"  Model: {self.model}")
             
         except ImportError:
-            raise ImportError(
-                "langchain-openai not installed. "
-                "Install with: pip install langchain-openai"
+            raise MissingDependencyError(
+                package_name="langchain-openai",
+                install_command="pip install langchain-openai",
+                purpose="LangChain OpenAI wrapper"
             )
     
     
@@ -293,9 +307,10 @@ class LLMClient:
             logger.info(f"  Model: {self.model}")
             
         except ImportError:
-            raise ImportError(
-                "langchain-anthropic not installed. "
-                "Install with: pip install langchain-anthropic"
+            raise MissingDependencyError(
+                package_name="langchain-anthropic",
+                install_command="pip install langchain-anthropic",
+                purpose="LangChain Anthropic wrapper"
             )
     
     
@@ -331,9 +346,10 @@ class LLMClient:
                 logger.info(f"  Base URL: https://api.groq.com/openai/v1")
                 
             except ImportError:
-                raise ImportError(
-                    "Neither langchain-groq nor langchain-openai installed. "
-                    "Install with: pip install langchain-groq OR pip install langchain-openai"
+                raise MissingDependencyError(
+                    package_name="langchain-groq or langchain-openai",
+                    install_command="pip install langchain-groq OR pip install langchain-openai",
+                    purpose="Groq API client"
                 )
     
     
@@ -353,9 +369,10 @@ class LLMClient:
             logger.info(f"  Base URL: {self.api_base_url}")
             
         except ImportError:
-            raise ImportError(
-                "langchain-community not installed. "
-                "Install with: pip install langchain-community"
+            raise MissingDependencyError(
+                package_name="langchain-community",
+                install_command="pip install langchain-community",
+                purpose="Ollama LLM wrapper"
             )
     
     

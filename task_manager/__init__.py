@@ -40,6 +40,18 @@ Example:
     >>> summary = agent.get_results_summary(final_state)
 """
 
+# Fix Unicode support on Windows BEFORE any other imports
+# This MUST be the first code that runs to ensure all logging uses UTF-8
+import sys
+import codecs
+if sys.platform == 'win32':
+    try:
+        if hasattr(sys.stdout, 'encoding') and sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
+            sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'backslashreplace')
+            sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer, 'backslashreplace')
+    except (AttributeError, TypeError):
+        pass
+
 __version__ = "1.0.0"
 __author__ = "Your Name"
 __all__ = [

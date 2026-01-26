@@ -7,6 +7,9 @@ Capabilities:
 - Execute code in isolated subprocess
 - Capture output and generated charts/images
 - Post results to blackboard for workflow integration
+
+Migration Status:
+- Week 8 Day 1: ✅ COMPLETED - Legacy support removed, standardized-only interface
 """
 
 from typing import Optional, Dict, Any
@@ -17,8 +20,21 @@ import tempfile
 import json
 import re
 import os
+import time
 
 from task_manager.utils.logger import get_logger
+from task_manager.models.messages import (
+    AgentExecutionRequest,
+    AgentExecutionResponse,
+    create_system_event,
+    create_error_response
+)
+from task_manager.utils import (
+    auto_convert_response,
+    validate_agent_execution_response,
+    exception_to_error_response
+)
+from task_manager.core.event_bus import get_event_bus
 
 logger = get_logger(__name__)
 
@@ -42,6 +58,8 @@ class CodeInterpreterAgent:
         Args:
             llm: Optional LLM instance for code generation
         """
+        self.agent_name = "code_interpreter_agent"
+        self.event_bus = get_event_bus()
         self.supported_operations = [
             "execute_analysis",
             "generate_code",
@@ -49,7 +67,7 @@ class CodeInterpreterAgent:
             "analyze_data"
         ]
         self.llm = llm
-        logger.info("Code Interpreter Agent initialized")
+        logger.info(f"[{self.agent_name}] Initialized with standardized-only interface")
         self._check_dependencies()
     
     
@@ -474,55 +492,209 @@ Do not include any markdown formatting or explanations - just the raw Python cod
         return prompt.strip()
     
     
-    def execute_task(
-        self,
-        operation: str,
-        parameters: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    def execute_task(self, request: AgentExecutionRequest) -> AgentExecutionResponse:
         """
-        Execute a code interpreter operation based on operation type.
+        Execute a code interpreter operation using standardized interface.
         
         Args:
-            operation: Type of operation (execute_analysis, generate_code, execute_code, analyze_data)
-            parameters: Operation parameters
+            request: AgentExecutionRequest with operation and parameters
         
         Returns:
-            Result dictionary
+            AgentExecutionResponse: Standardized response
         """
-        logger.info(f"Executing Code Interpreter operation: {operation}")
+        start_time = time.time()
         
-        if operation == "execute_analysis":
-            return self.execute_analysis(
-                request=parameters.get('request', ''),
-                data_context=parameters.get('data_context'),
-                output_dir=parameters.get('output_dir')
+        try:
+            # Extract request parameters
+            operation = request.get('operation', '')
+            parameters = request.get('parameters', {})
+            task_id = request.get('task_id', f"code_interpreter_{int(start_time * 1000)}")
+            
+            logger.info(f"[{self.agent_name}] Executing operation: {operation}")
+            
+            # Route to operation handlers
+            if operation == "execute_analysis":
+                legacy_result = self.execute_analysis(
+                    request=parameters.get('request', ''),
+                    data_context=parameters.get('data_context'),
+                    output_dir=parameters.get('output_dir')
+                )
+            
+            elif operation == "generate_code":
+                legacy_result = self._generate_code(
+                    request=parameters.get('request', ''),
+                    data_context=parameters.get('data_context'),
+                    output_dir=parameters.get('output_dir', '')
+                )
+            
+            elif operation == "execute_code":
+                legacy_result = self._execute_code(
+                    code=parameters.get('code', ''),
+                    data_context=parameters.get('data_context'),
+                    output_dir=parameters.get('output_dir', '')
+                )
+            
+            elif operation == "analyze_data":
+                # Alias for execute_analysis
+                legacy_result = self.execute_analysis(
+                    request=parameters.get('request', ''),
+                    data_context=parameters.get('data_context'),
+                    output_dir=parameters.get('output_dir')
+                )
+            
+            else:
+                error_response = create_error_response(
+                    error_code="UNKNOWN_OPERATION",
+                    error_type="validation_error",
+                    message=f"Unknown operation: {operation}",
+                    source=self.agent_name,
+                    details={"supported_operations": self.supported_operations}
+                )
+                return self._error_response_to_agent_response(error_response)
+            
+            # Convert to standardized format
+            standardized_response = self._convert_to_standard_response(
+                legacy_result, operation, task_id, start_time, parameters
             )
+            
+            # Publish completion event
+            self._publish_completion_event(standardized_response, operation)
+            
+            return standardized_response
         
-        elif operation == "generate_code":
-            return self._generate_code(
-                request=parameters.get('request', ''),
-                data_context=parameters.get('data_context'),
-                output_dir=parameters.get('output_dir', '')
+        except Exception as e:
+            logger.error(f"[{self.agent_name}] Error in execute_task: {str(e)}")
+            error_response = exception_to_error_response(
+                e,
+                source=self.agent_name,
+                operation=operation if 'operation' in locals() else "unknown"
             )
+            return self._error_response_to_agent_response(error_response)
+    
+    
+    def _convert_to_standard_response(
+        self,
+        legacy_result: Dict[str, Any],
+        operation: str,
+        task_id: str,
+        start_time: float,
+        parameters: Dict[str, Any]
+    ) -> AgentExecutionResponse:
+        """Convert legacy result to standardized AgentExecutionResponse."""
+        execution_time_ms = int((time.time() - start_time) * 1000)
+        success = legacy_result.get("success", False)
         
-        elif operation == "execute_code":
-            return self._execute_code(
-                code=parameters.get('code', ''),
-                data_context=parameters.get('data_context'),
-                output_dir=parameters.get('output_dir', '')
-            )
+        # Build standardized response
+        response: AgentExecutionResponse = {
+            "status": "success" if success else "failure",
+            "success": success,
+            "result": legacy_result if success else {},
+            "artifacts": [],
+            "execution_time_ms": execution_time_ms,
+            "timestamp": datetime.now().isoformat(),
+            "agent_name": self.agent_name,
+            "operation": operation,
+            "blackboard_entries": [],
+            "warnings": []
+        }
         
-        elif operation == "analyze_data":
-            # Alias for execute_analysis with more specific focus on data analysis
-            return self.execute_analysis(
-                request=parameters.get('request', ''),
-                data_context=parameters.get('data_context'),
-                output_dir=parameters.get('output_dir')
-            )
+        # Add error information if failed
+        if not success:
+            error_msg = legacy_result.get("error", "Unknown error")
+            response["error"] = str(error_msg)
         
-        else:
-            return {
-                "success": False,
-                "error": f"Unknown operation: {operation}",
-                "supported_operations": self.supported_operations
+        # Add blackboard entries for successful operations
+        if success:
+            blackboard_entries = []
+            
+            if operation in ["execute_analysis", "analyze_data"]:
+                # Store analysis results
+                blackboard_entries.append({
+                    "key": f"analysis_result_{task_id}",
+                    "value": {
+                        "generated_code": legacy_result.get("generated_code"),
+                        "output": legacy_result.get("output"),
+                        "generated_files": legacy_result.get("generated_files", {}),
+                        "output_directory": legacy_result.get("output_directory"),
+                        "execution_time": legacy_result.get("execution_time")
+                    },
+                    "scope": "workflow",
+                    "ttl": 3600
+                })
+            
+            elif operation == "generate_code":
+                # Store generated code
+                blackboard_entries.append({
+                    "key": f"generated_code_{task_id}",
+                    "value": {
+                        "code": legacy_result.get("code"),
+                        "request": parameters.get("request")
+                    },
+                    "scope": "workflow",
+                    "ttl": 1800
+                })
+            
+            elif operation == "execute_code":
+                # Store execution results
+                blackboard_entries.append({
+                    "key": f"code_execution_{task_id}",
+                    "value": {
+                        "output": legacy_result.get("output"),
+                        "execution_time": legacy_result.get("execution_time"),
+                        "error": legacy_result.get("error")
+                    },
+                    "scope": "workflow",
+                    "ttl": 1800
+                })
+            
+            if blackboard_entries:
+                response["blackboard_entries"] = blackboard_entries
+        
+        return response
+    
+    
+    def _publish_completion_event(self, response: AgentExecutionResponse, operation: str):
+        """Publish completion event to EventBus."""
+        try:
+            event_type_map = {
+                "execute_analysis": "code_analysis_completed",
+                "generate_code": "code_generated",
+                "execute_code": "code_executed",
+                "analyze_data": "data_analyzed"
             }
+            
+            event_type = event_type_map.get(operation, "code_interpreter_completed")
+            
+            event = create_system_event(
+                event_type=event_type,
+                event_category="agent_execution",
+                source_agent=self.agent_name,
+                payload={
+                    "status": response["status"],
+                    "operation": operation,
+                    "execution_time_ms": response["execution_time_ms"]
+                }
+            )
+            
+            self.event_bus.publish(event)
+            logger.debug(f"Published {event_type} event")
+        
+        except Exception as e:
+            logger.error(f"Error publishing completion event: {str(e)}")
+    
+    
+    def _error_response_to_agent_response(self, error_response: Any) -> AgentExecutionResponse:
+        """Convert ErrorResponse to AgentExecutionResponse."""
+        return {
+            "status": "failure",
+            "success": False,
+            "result": {},
+            "artifacts": [],
+            "execution_time_ms": 0,
+            "timestamp": datetime.now().isoformat(),
+            "agent_name": self.agent_name,
+            "operation": "unknown",
+            "blackboard_entries": [],
+            "warnings": [],
+            "error": error_response.get("message", "Unknown error") if isinstance(error_response, dict) else str(error_response)
+        }
