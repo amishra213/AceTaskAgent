@@ -123,7 +123,7 @@ Analyze this task and respond with ONLY a JSON object:
   "reasoning": "brief explanation",
   "subtasks": ["subtask1", "subtask2", ...] or null,
   "search_query": "query for web search" or null,
-  "file_operation": {{"type": "pdf" or "excel" or "ocr" or "web_search" or "code_interpreter" or "data_extraction", "operation": "operation_name", "parameters": {{...}}}} or null,
+  "file_operation": {{"type": "pdf" or "excel" or "ocr" or "web_search" or "code_interpreter" or "data_extraction" or "document", "operation": "operation_name", "parameters": {{...}}}} or null,
   "estimated_complexity": "low/medium/high",
   "requires_human_review": false
 }}
@@ -140,12 +140,19 @@ Guidelines:
 - Use "execute_problem_solver_task" if task requires analysis, synthesis, comparison, or problem-solving using blackboard data (analyze trends, comprehensive analysis, synthesis, comparison)
 - Use "execute_document_task" if task requires document generation or formatting
 - Provide search_query only if action is "execute_web_search_task" and requires a specific search
-- Provide file_operation only if action is "execute_pdf_task", "execute_excel_task", "execute_ocr_task", "execute_web_search_task", "execute_code_interpreter_task", or "execute_data_extraction_task"
+- Provide file_operation only if action is "execute_pdf_task", "execute_excel_task", "execute_ocr_task", "execute_web_search_task", "execute_code_interpreter_task", "execute_data_extraction_task", or "execute_document_task"
   - For PDF: operations are "read", "create", "merge", "extract_pages"
   - For Excel: operations are "read", "create", "write", "format"
   - For OCR: operations are "ocr_image", "extract_images_from_pdf", "batch_ocr", "process_screenshot"
   - For Web Search: operations are "search", "scrape", "fetch", "summarize", "smart_scrape", "capture_screenshot", "handle_pagination"
   - For Data Extraction: operations are "extract_relevant", "search_content", "get_file_preview", "summarize_folder"
+  - For Document: operations are "create_docx", "create_txt", "append_docx", "append_txt", "read_docx", "read_txt"
+    * create_docx: parameters = {{"content": "formatted document content (can use markdown or plain text)", "title": "document title", "file_path": "optional path to output file"}}
+    * create_txt: parameters = {{"content": "text content to write", "encoding": "utf-8", "file_path": "optional path to output file"}}
+    * append_docx: parameters = {{"file_path": "path to existing docx file", "content": "additional content to append"}}
+    * append_txt: parameters = {{"file_path": "path to existing txt file", "content": "additional content to append"}}
+    * read_docx: parameters = {{"file_path": "path to docx file to read"}}
+    * read_txt: parameters = {{"file_path": "path to txt file to read"}}
 - Be concise and specific in subtasks
 - Set requires_human_review to false (human review happens later if needed)
 """

@@ -85,7 +85,8 @@ class ProblemSolverAgent:
             "interpret_human_input",
             "format_for_agent",
             "generate_retry_parameters",
-            "create_task_output"
+            "create_task_output",
+            "analyze_task"  # NEW: Comprehensive analysis using blackboard data
         ]
         
         # Supported output formats
@@ -279,6 +280,16 @@ class ProblemSolverAgent:
                     expected_output_type=parameters.get('expected_output_type')
                 )
             
+            elif operation == "analyze_task":
+                # NEW: Comprehensive task analysis using blackboard data
+                result = self.analyze_task(
+                    task_description=task_dict.get('task_description', parameters.get('task_description', '')),
+                    objective=parameters.get('objective', ''),
+                    blackboard_entries=parameters.get('blackboard_entries', []),
+                    analysis_type=parameters.get('analysis_type', 'comprehensive'),
+                    depth_level=parameters.get('depth_level', 0)
+                )
+            
             else:
                 result = {
                     "success": False,
@@ -379,6 +390,22 @@ class ProblemSolverAgent:
                 "ttl_seconds": 1800
             })
         
+        # For analysis tasks, share comprehensive findings
+        if operation == "analyze_task" and success:
+            blackboard_entries.append({
+                "key": f"analysis_{task_id}",
+                "value": {
+                    "analysis": legacy_result.get("analysis", ""),
+                    "key_insights": legacy_result.get("key_insights", []),
+                    "patterns": legacy_result.get("patterns_identified", []),
+                    "contradictions": legacy_result.get("contradictions", []),
+                    "recommendations": legacy_result.get("recommendations", []),
+                    "confidence": legacy_result.get("confidence_level", "MEDIUM")
+                },
+                "scope": "workflow",
+                "ttl_seconds": 3600
+            })
+        
         # Build standardized response
         response: AgentExecutionResponse = {
             "status": "success" if success else "failure",
@@ -434,7 +461,8 @@ class ProblemSolverAgent:
                 "interpret_human_input": "human_input_interpreted",
                 "format_for_agent": "data_formatted",
                 "generate_retry_parameters": "retry_params_generated",
-                "create_task_output": "task_output_created"
+                "create_task_output": "task_output_created",
+                "analyze_task": "task_analyzed"  # NEW: Event for task analysis
             }
             
             event_type = event_type_map.get(operation, "problem_solver_completed")
@@ -1201,6 +1229,359 @@ Format this human input as a proper task output that other agents can consume.""
             },
             "original_input": human_input,
             "created_at": datetime.now().isoformat()
+        }
+    
+    
+    def analyze_task(
+        self,
+        task_description: str,
+        objective: str = "",
+        blackboard_entries: Optional[List[Dict[str, Any]]] = None,
+        analysis_type: str = "comprehensive",
+        depth_level: int = 0
+    ) -> Dict[str, Any]:
+        """
+        Perform comprehensive analysis of a task using available blackboard data.
+        
+        This method analyzes blackboard entries from upstream agents to provide
+        insights, identify patterns, detect contradictions, and synthesize findings.
+        
+        Args:
+            task_description: Description of the task to analyze
+            objective: Overall objective/goal context
+            blackboard_entries: List of blackboard entries from upstream agents
+            analysis_type: Type of analysis (comprehensive, comparative, synthesis)
+            depth_level: Current depth level in task hierarchy
+            
+        Returns:
+            Dict containing:
+            - success: Whether analysis completed successfully
+            - analysis: Detailed analysis text
+            - key_insights: List of key insights discovered
+            - patterns_identified: List of patterns found in the data
+            - contradictions: List of any contradictions or conflicts
+            - recommendations: List of recommendations for next steps
+            - confidence_level: Confidence in the analysis (HIGH/MEDIUM/LOW)
+            - data_sources: List of agents/sources used in analysis
+        """
+        logger.info("=" * 80)
+        logger.info("[PROBLEM SOLVER] Analyzing Task with Blackboard Data")
+        logger.info("=" * 80)
+        logger.info(f"[ANALYZE] Task: {task_description[:100]}...")
+        logger.info(f"[ANALYZE] Analysis Type: {analysis_type}")
+        logger.info(f"[ANALYZE] Depth Level: {depth_level}")
+        
+        # Initialize result structure
+        result = {
+            "success": False,
+            "analysis": "",
+            "key_insights": [],
+            "patterns_identified": [],
+            "contradictions": [],
+            "recommendations": [],
+            "confidence_level": "LOW",
+            "data_sources": []
+        }
+        
+        # Validate inputs
+        if not task_description:
+            logger.warning("[ANALYZE] No task description provided")
+            result["analysis"] = "No task description provided for analysis"
+            return result
+        
+        blackboard_entries = blackboard_entries or []
+        logger.info(f"[ANALYZE] Blackboard entries available: {len(blackboard_entries)}")
+        
+        if not blackboard_entries:
+            logger.warning("[ANALYZE] No blackboard entries available for analysis")
+            result["analysis"] = "No data available from upstream agents for analysis. The blackboard is empty."
+            result["recommendations"] = [
+                "Execute upstream data gathering tasks first",
+                "Ensure data collection agents (web_search, pdf, excel, ocr) have completed successfully",
+                "Check that agents are posting findings to the blackboard with correct scope",
+                "Verify task dependency chain - analysis tasks need upstream data tasks to complete first"
+            ]
+            result["confidence_level"] = "LOW"
+            return result
+        
+        # Log details about available data
+        logger.info(f"[ANALYZE] Analyzing {len(blackboard_entries)} blackboard entries")
+        
+        # Extract data sources
+        data_sources = list(set([
+            entry.get('source_agent', 'unknown') 
+            for entry in blackboard_entries
+        ]))
+        result["data_sources"] = data_sources
+        logger.info(f"[ANALYZE] Data sources: {', '.join(data_sources)}")
+        
+        # If no LLM client, perform rule-based analysis
+        if not self.llm_client:
+            logger.warning("[ANALYZE] No LLM client available, using rule-based analysis")
+            return self._rule_based_analysis(
+                task_description, objective, blackboard_entries, analysis_type
+            )
+        
+        # Build analysis prompt with blackboard context
+        analysis_prompt = self._build_analysis_prompt(
+            task_description=task_description,
+            objective=objective,
+            blackboard_entries=blackboard_entries,
+            analysis_type=analysis_type,
+            depth_level=depth_level
+        )
+        
+        try:
+            from langchain_core.messages import HumanMessage, SystemMessage
+            
+            system_prompt = """You are an expert data analyst and problem solver.
+Your task is to analyze information from multiple sources and provide comprehensive insights.
+
+You must respond with ONLY valid JSON in this exact format:
+{
+  "success": true,
+  "analysis": "Detailed comprehensive analysis of all available data",
+  "key_insights": ["insight 1", "insight 2", "insight 3"],
+  "patterns_identified": ["pattern 1", "pattern 2"],
+  "contradictions": ["contradiction 1", "contradiction 2"] or [],
+  "recommendations": ["recommendation 1", "recommendation 2", "recommendation 3"],
+  "confidence_level": "HIGH" or "MEDIUM" or "LOW"
+}
+
+IMPORTANT:
+- Provide specific, actionable insights based on the actual data
+- Identify concrete patterns in the data, not generic observations
+- Flag any contradictions or inconsistencies between sources
+- Give clear recommendations for next steps
+- Set confidence based on data quality and completeness"""
+            
+            logger.info("[ANALYZE] Sending analysis request to LLM...")
+            logger.debug(f"[ANALYZE] Prompt length: {len(analysis_prompt)} chars")
+            
+            response = self.llm_client.invoke([
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=analysis_prompt)
+            ])
+            
+            response_content = response.content if hasattr(response, 'content') else str(response)
+            logger.info("[ANALYZE] LLM response received")
+            logger.debug(f"[ANALYZE] Response length: {len(response_content)} chars")
+            
+            # Parse the LLM response
+            parsed_result = self._parse_analysis_response(response_content)
+            
+            # Merge with result template
+            result.update(parsed_result)
+            result["analyzed_at"] = datetime.now().isoformat()
+            result["entries_analyzed"] = len(blackboard_entries)
+            
+            logger.info(f"[ANALYZE] ✓ Analysis completed successfully")
+            logger.info(f"[ANALYZE]   Insights found: {len(result.get('key_insights', []))}")
+            logger.info(f"[ANALYZE]   Patterns identified: {len(result.get('patterns_identified', []))}")
+            logger.info(f"[ANALYZE]   Contradictions: {len(result.get('contradictions', []))}")
+            logger.info(f"[ANALYZE]   Confidence: {result.get('confidence_level')}")
+            logger.info("=" * 80)
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"[ANALYZE] Error during LLM analysis: {str(e)}", exc_info=True)
+            # Fallback to rule-based analysis
+            return self._rule_based_analysis(
+                task_description, objective, blackboard_entries, analysis_type
+            )
+    
+    
+    def _build_analysis_prompt(
+        self,
+        task_description: str,
+        objective: str,
+        blackboard_entries: List[Dict[str, Any]],
+        analysis_type: str,
+        depth_level: int
+    ) -> str:
+        """Build the analysis prompt with blackboard context."""
+        # Organize entries by source agent
+        entries_by_agent: Dict[str, List[Dict[str, Any]]] = {}
+        for entry in blackboard_entries:
+            agent = entry.get('source_agent', 'unknown')
+            if agent not in entries_by_agent:
+                entries_by_agent[agent] = []
+            entries_by_agent[agent].append(entry)
+        
+        # Build prompt sections
+        prompt_parts = [
+            f"OBJECTIVE: {objective}\n" if objective else "",
+            f"TASK: {task_description}\n",
+            f"ANALYSIS TYPE: {analysis_type}\n",
+            f"DEPTH LEVEL: {depth_level}\n",
+            "\nAVAILABLE DATA FROM UPSTREAM AGENTS:\n",
+            "=" * 80 + "\n"
+        ]
+        
+        # Add data from each agent
+        for agent, entries in entries_by_agent.items():
+            prompt_parts.append(f"\n📊 DATA FROM {agent.upper()}:\n")
+            prompt_parts.append("-" * 80 + "\n")
+            
+            for idx, entry in enumerate(entries[:5], 1):  # Limit to 5 entries per agent
+                content = entry.get('content', {})
+                entry_type = entry.get('entry_type', 'unknown')
+                timestamp = entry.get('timestamp', 'unknown')
+                
+                prompt_parts.append(f"\nEntry {idx} ({entry_type}):\n")
+                prompt_parts.append(f"Timestamp: {timestamp}\n")
+                
+                # Format content based on type
+                if isinstance(content, dict):
+                    # Extract key information
+                    for key, value in list(content.items())[:10]:  # Limit fields
+                        if isinstance(value, (str, int, float, bool)):
+                            prompt_parts.append(f"  {key}: {value}\n")
+                        elif isinstance(value, list) and len(value) < 20:
+                            prompt_parts.append(f"  {key}: {value}\n")
+                        elif isinstance(value, dict) and len(str(value)) < 500:
+                            prompt_parts.append(f"  {key}: {json.dumps(value, indent=2)}\n")
+                else:
+                    prompt_parts.append(f"  Data: {str(content)[:500]}\n")
+        
+        # Add analysis instructions
+        prompt_parts.extend([
+            "\n" + "=" * 80 + "\n",
+            "\nYOUR TASK:\n",
+            "1. Analyze ALL the data provided from different agents\n",
+            "2. Identify key insights and patterns across all sources\n",
+            "3. Compare findings from different agents and flag contradictions\n",
+            "4. Synthesize the information into actionable conclusions\n",
+            "5. Provide specific recommendations based on the data\n",
+            "\nFocus on:\n",
+            "- Concrete insights derived from actual data values\n",
+            "- Patterns and trends visible in the data\n",
+            "- Relationships between data from different sources\n",
+            "- Any gaps, inconsistencies, or contradictions\n",
+            "- Actionable next steps based on the analysis\n"
+        ])
+        
+        return "".join(prompt_parts)
+    
+    
+    def _parse_analysis_response(self, response_content: str) -> Dict[str, Any]:
+        """Parse LLM analysis response into structured format."""
+        try:
+            # Try to extract JSON from the response
+            json_match = re.search(r'\{.*\}', response_content, re.DOTALL)
+            if json_match:
+                response_json = json.loads(json_match.group())
+                
+                # Validate required fields
+                result = {
+                    "success": response_json.get("success", True),
+                    "analysis": response_json.get("analysis", ""),
+                    "key_insights": response_json.get("key_insights", []),
+                    "patterns_identified": response_json.get("patterns_identified", []),
+                    "contradictions": response_json.get("contradictions", []),
+                    "recommendations": response_json.get("recommendations", []),
+                    "confidence_level": response_json.get("confidence_level", "MEDIUM")
+                }
+                
+                return result
+            else:
+                # No JSON found, treat as plain text analysis
+                logger.warning("[ANALYZE] No JSON in response, using plain text")
+                return {
+                    "success": True,
+                    "analysis": response_content,
+                    "key_insights": [],
+                    "patterns_identified": [],
+                    "contradictions": [],
+                    "recommendations": [],
+                    "confidence_level": "LOW"
+                }
+                
+        except json.JSONDecodeError as e:
+            logger.error(f"[ANALYZE] JSON parse error: {e}")
+            return {
+                "success": False,
+                "analysis": response_content,
+                "key_insights": [],
+                "patterns_identified": [],
+                "contradictions": [],
+                "recommendations": [],
+                "confidence_level": "LOW"
+            }
+    
+    
+    def _rule_based_analysis(
+        self,
+        task_description: str,
+        objective: str,
+        blackboard_entries: List[Dict[str, Any]],
+        analysis_type: str
+    ) -> Dict[str, Any]:
+        """
+        Perform rule-based analysis when LLM is not available.
+        
+        This provides basic analysis by examining blackboard entry structure.
+        """
+        logger.info("[ANALYZE] Performing rule-based analysis (no LLM)")
+        
+        # Extract statistics
+        agents_used = set([entry.get('source_agent', 'unknown') for entry in blackboard_entries])
+        entry_types = set([entry.get('entry_type', 'unknown') for entry in blackboard_entries])
+        
+        # Count data points
+        total_entries = len(blackboard_entries)
+        successful_entries = sum(1 for e in blackboard_entries 
+                                if e.get('content', {}).get('success', True))
+        
+        # Build basic analysis
+        analysis_parts = [
+            f"Rule-based analysis of {total_entries} blackboard entries.",
+            f"\nData collected from {len(agents_used)} agents: {', '.join(agents_used)}",
+            f"\nEntry types: {', '.join(entry_types)}",
+            f"\nSuccessful entries: {successful_entries}/{total_entries}",
+        ]
+        
+        # Extract key insights from content
+        key_insights = []
+        for entry in blackboard_entries[:10]:
+            content = entry.get('content', {})
+            if isinstance(content, dict):
+                # Look for interesting keys
+                if 'summary' in content:
+                    key_insights.append(f"Summary from {entry.get('source_agent')}: {content['summary'][:100]}")
+                elif 'findings' in content:
+                    key_insights.append(f"Findings from {entry.get('source_agent')}: {str(content['findings'])[:100]}")
+                elif 'results_count' in content:
+                    key_insights.append(f"{entry.get('source_agent')} found {content['results_count']} results")
+        
+        # Basic patterns
+        patterns = [
+            f"Data collection pattern: {len(agents_used)} different data sources",
+            f"Information depth: {total_entries} total findings"
+        ]
+        
+        # Basic recommendations
+        recommendations = [
+            "Review detailed findings from each data source",
+            f"Focus on {len(agents_used)} agent outputs for comprehensive view"
+        ]
+        
+        if successful_entries < total_entries:
+            recommendations.append(f"Investigate {total_entries - successful_entries} failed data collection attempts")
+        
+        return {
+            "success": True,
+            "analysis": "\n".join(analysis_parts),
+            "key_insights": key_insights[:5],
+            "patterns_identified": patterns,
+            "contradictions": [],
+            "recommendations": recommendations,
+            "confidence_level": "LOW",
+            "data_sources": list(agents_used),
+            "analyzed_at": datetime.now().isoformat(),
+            "entries_analyzed": total_entries,
+            "analysis_method": "rule_based"
         }
     
     

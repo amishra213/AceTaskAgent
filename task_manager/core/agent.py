@@ -402,6 +402,21 @@ class TaskManagerAgent:
         return cache_key
     
     
+    def _generate_entry_id(self, entry: BlackboardEntry) -> str:
+        """
+        Generate a unique ID for a blackboard entry based on its content.
+        
+        Args:
+            entry: The blackboard entry to generate an ID for
+            
+        Returns:
+            A unique string ID for the entry
+        """
+        # Create a deterministic hash from entry attributes
+        id_content = f"{entry.get('source_agent')}:{entry.get('source_task_id')}:{entry.get('entry_type')}"
+        entry_id = hashlib.md5(id_content.encode('utf-8')).hexdigest()[:12]
+        return entry_id
+    
     def _create_initial_state(self) -> AgentState:
         """
         Create and return the initial agent state with Blackboard pattern and deep hierarchy support.
@@ -439,7 +454,8 @@ class TaskManagerAgent:
             "iteration_count": 0,
             "max_iterations": self.config.max_iterations,
             "requires_human_review": False,
-            "human_feedback": ""
+            "human_feedback": "",
+            "human_review_context": {}  # Context for human review workflows
         }
     
     
@@ -912,7 +928,7 @@ class TaskManagerAgent:
                 "max_retries": 1
             }
             
-            diagnose_response = cast(AgentExecutionResponse, self.problem_solver_agent.execute_task(request=diagnose_request))
+            diagnose_response = cast(AgentExecutionResponse, self.problem_solver_agent.execute_task(diagnose_request))
             error_analysis = diagnose_response.get('result', {}) if diagnose_response['success'] else None
             
             if error_analysis:
@@ -1155,6 +1171,73 @@ class TaskManagerAgent:
             }
     
     
+    def _filter_relevant_blackboard_entries(
+        self,
+        blackboard: list[BlackboardEntry],
+        task_id: str,
+        agent_name: str = ""
+    ) -> list[BlackboardEntry]:
+        """
+        Filter blackboard entries relevant to the current task.
+        
+        This provides contextual data to agents so they can use information
+        from upstream tasks (sibling tasks, parent tasks, etc.).
+        
+        Args:
+            blackboard: Full blackboard from state
+            task_id: Current task ID
+            agent_name: Agent name for logging
+            
+        Returns:
+            Filtered list of relevant blackboard entries
+        """
+        if not blackboard:
+            return []
+        
+        task_prefix = '.'.join(task_id.split('.')[:-1]) if '.' in task_id else task_id
+        
+        def is_relevant_entry(entry: BlackboardEntry, current_task_id: str, prefix: str) -> bool:
+            """Check if blackboard entry is relevant to current task."""
+            relevant_to = entry.get('relevant_to', [])
+            
+            # No specific relevance - available to all tasks
+            if not relevant_to:
+                return True
+            
+            # Directly relevant to this task
+            if current_task_id in relevant_to:
+                return True
+            
+            # Include data from sibling/related tasks
+            for rel_task in relevant_to:
+                # Same parent (sibling tasks) - e.g., 1.1.1 and 1.1.2 data available to 1.1.3
+                rel_prefix = '.'.join(rel_task.split('.')[:-1]) if '.' in rel_task else rel_task
+                if rel_prefix == prefix and prefix:  # Only if we have a valid prefix
+                    return True
+                
+                # Parent task data - e.g., 1.1 data available to 1.1.3
+                if current_task_id.startswith(rel_task + '.'):
+                    return True
+                
+                # Child task data - e.g., 1.1.3 data available to 1.1
+                if rel_task.startswith(current_task_id + '.'):
+                    return True
+            
+            return False
+        
+        relevant_entries = [
+            e for e in blackboard
+            if is_relevant_entry(e, task_id, task_prefix)
+        ]
+        
+        if agent_name:
+            logger.debug(f"[{agent_name}] Blackboard filtering: {len(blackboard)} total → {len(relevant_entries)} relevant")
+            if blackboard and not relevant_entries:
+                logger.warning(f"[{agent_name}] ⚠️  All {len(blackboard)} blackboard entries filtered out for task {task_id}")
+        
+        return relevant_entries
+    
+    
     def _execute_pdf_task(self, state: AgentState) -> AgentState:
         """
         Execute a PDF file operation task using PDFAgent.
@@ -1206,8 +1289,13 @@ class TaskManagerAgent:
             logger.info(f"[PDF AGENT] Parameters: {parameters}")
             logger.info("-" * 80)
             
+            # Filter relevant blackboard entries for context
+            blackboard = state.get('blackboard', [])
+            relevant_entries = self._filter_relevant_blackboard_entries(blackboard, task_id, "PDF AGENT")
+            
             # Create standardized AgentExecutionRequest
             logger.info(f"[PDF AGENT] Calling PDFAgent.execute_task() with standardized request...")
+            logger.info(f"[PDF AGENT] Providing {len(relevant_entries)} relevant blackboard entries for context")
             request: AgentExecutionRequest = {
                 "task_id": task_id,
                 "task_description": task['description'],
@@ -1219,7 +1307,7 @@ class TaskManagerAgent:
                 "output_folder": str(self.config.folders.output_path),
                 "cache_enabled": True,
                 "blackboard": cast(list[dict[str, Any]], state.get('blackboard', [])),
-                "relevant_entries": [],
+                "relevant_entries": [self._generate_entry_id(e) for e in relevant_entries],
                 "max_retries": 3
             }
             
@@ -1417,8 +1505,13 @@ class TaskManagerAgent:
             logger.info(f"[EXCEL AGENT] Parameters: {parameters}")
             logger.info("-" * 80)
             
+            # Filter relevant blackboard entries for context
+            blackboard = state.get('blackboard', [])
+            relevant_entries = self._filter_relevant_blackboard_entries(blackboard, task_id, "EXCEL AGENT")
+            
             # Create standardized AgentExecutionRequest
             logger.info(f"[EXCEL AGENT] Calling ExcelAgent.execute_task() with standardized request...")
+            logger.info(f"[EXCEL AGENT] Providing {len(relevant_entries)} relevant blackboard entries for context")
             request: AgentExecutionRequest = {
                 "task_id": task_id,
                 "task_description": task['description'],
@@ -1430,7 +1523,7 @@ class TaskManagerAgent:
                 "output_folder": str(self.config.folders.output_path),
                 "cache_enabled": True,
                 "blackboard": cast(list[dict[str, Any]], state.get('blackboard', [])),
-                "relevant_entries": [],
+                "relevant_entries": [self._generate_entry_id(e) for e in relevant_entries],
                 "max_retries": 3
             }
             
@@ -1786,8 +1879,13 @@ class TaskManagerAgent:
             logger.info(f"[OCR AGENT] Parameters: {parameters}")
             logger.info("-" * 80)
             
+            # Filter relevant blackboard entries for context
+            blackboard = state.get('blackboard', [])
+            relevant_entries = self._filter_relevant_blackboard_entries(blackboard, task_id, "OCR AGENT")
+            
             # Create standardized AgentExecutionRequest
             logger.info(f"[OCR AGENT] Calling OCRImageAgent.execute_task() with standardized request...")
+            logger.info(f"[OCR AGENT] Providing {len(relevant_entries)} relevant blackboard entries for context")
             request: AgentExecutionRequest = {
                 "task_id": task_id,
                 "task_description": task['description'],
@@ -1799,7 +1897,7 @@ class TaskManagerAgent:
                 "output_folder": str(self.config.folders.output_path),
                 "cache_enabled": True,
                 "blackboard": cast(list[dict[str, Any]], state.get('blackboard', [])),
-                "relevant_entries": [],
+                "relevant_entries": [self._generate_entry_id(e) for e in relevant_entries],
                 "max_retries": 3
             }
             
@@ -2079,8 +2177,13 @@ class TaskManagerAgent:
             logger.info(f"[WEB SEARCH AGENT] Parameters: {params}")
             logger.info("-" * 80)
             
+            # Filter relevant blackboard entries for context
+            blackboard = state.get('blackboard', [])
+            relevant_entries = self._filter_relevant_blackboard_entries(blackboard, task_id, "WEB SEARCH AGENT")
+            
             # Create standardized AgentExecutionRequest
             logger.info(f"[WEB SEARCH AGENT] Calling WebSearchAgent.execute_task() with standardized request...")
+            logger.info(f"[WEB SEARCH AGENT] Providing {len(relevant_entries)} relevant blackboard entries for context")
             request: AgentExecutionRequest = {
                 "task_id": task_id,
                 "task_description": task['description'],
@@ -2092,7 +2195,7 @@ class TaskManagerAgent:
                 "output_folder": str(self.config.folders.output_path),
                 "cache_enabled": True,
                 "blackboard": cast(list[dict[str, Any]], state.get('blackboard', [])),
-                "relevant_entries": [],
+                "relevant_entries": [self._generate_entry_id(e) for e in relevant_entries],
                 "max_retries": 3
             }
             
@@ -2334,8 +2437,13 @@ class TaskManagerAgent:
             logger.info(f"[CODE INTERPRETER AGENT] Parameters: {params}")
             logger.info("-" * 80)
             
+            # Filter relevant blackboard entries for context
+            blackboard = state.get('blackboard', [])
+            relevant_entries = self._filter_relevant_blackboard_entries(blackboard, task_id, "CODE INTERPRETER AGENT")
+            
             # Create standardized AgentExecutionRequest
             logger.info(f"[CODE INTERPRETER AGENT] Calling CodeInterpreterAgent.execute_task() with standardized request...")
+            logger.info(f"[CODE INTERPRETER AGENT] Providing {len(relevant_entries)} relevant blackboard entries for context")
             request: AgentExecutionRequest = {
                 "task_id": task_id,
                 "task_description": task['description'],
@@ -2347,7 +2455,7 @@ class TaskManagerAgent:
                 "output_folder": str(self.config.folders.output_path),
                 "cache_enabled": True,
                 "blackboard": cast(list[dict[str, Any]], state.get('blackboard', [])),
-                "relevant_entries": [],
+                "relevant_entries": [self._generate_entry_id(e) for e in relevant_entries],
                 "max_retries": 3
             }
             
@@ -2509,8 +2617,13 @@ class TaskManagerAgent:
             logger.info(f"[DATA EXTRACTION AGENT] Parameters: {parameters}")
             logger.info("-" * 80)
             
+            # Filter relevant blackboard entries for context
+            blackboard = state.get('blackboard', [])
+            relevant_entries = self._filter_relevant_blackboard_entries(blackboard, task_id, "DATA EXTRACTION AGENT")
+            
             # Create standardized AgentExecutionRequest
             logger.info(f"[DATA EXTRACTION AGENT] Calling DataExtractionAgent.execute_task() with standardized request...")
+            logger.info(f"[DATA EXTRACTION AGENT] Providing {len(relevant_entries)} relevant blackboard entries for context")
             request: AgentExecutionRequest = {
                 "task_id": task_id,
                 "task_description": task['description'],
@@ -2522,7 +2635,7 @@ class TaskManagerAgent:
                 "output_folder": str(self.config.folders.output_path),
                 "cache_enabled": True,
                 "blackboard": cast(list[dict[str, Any]], state.get('blackboard', [])),
-                "relevant_entries": [],
+                "relevant_entries": [self._generate_entry_id(e) for e in relevant_entries],
                 "max_retries": 3
             }
             
@@ -2638,14 +2751,95 @@ class TaskManagerAgent:
         try:
             # Extract file operation details from analysis
             file_operation = analysis.get('file_operation', {})
-            if not file_operation or file_operation.get('type') not in ['docx', 'txt']:
+            
+            # VALIDATION: Check if file_operation is valid
+            # Accepts type as "document" or "docx"/"txt" for backwards compatibility
+            operation_type = file_operation.get('type', '')
+            valid_types = ['document', 'docx', 'txt']
+            
+            if not file_operation or operation_type not in valid_types:
                 logger.error(f"[DOCUMENT AGENT] ✗ Invalid document operation specification")
-                logger.error(f"[DOCUMENT AGENT]   Received: {file_operation}")
+                logger.error(f"[DOCUMENT AGENT]   Received type: '{operation_type}'")
+                logger.error(f"[DOCUMENT AGENT]   Valid types: {valid_types}")
+                logger.error(f"[DOCUMENT AGENT]   Full file_operation: {file_operation}")
+                logger.error(f"[DOCUMENT AGENT]   Full analysis: {analysis}")
                 
+                # RECOVERY: Attempt to recover with ProblemSolverAgent
+                logger.info("[DOCUMENT AGENT] Attempting recovery with ProblemSolverAgent...")
+                
+                error_context = {
+                    "task_id": task_id,
+                    "task_description": task['description'],
+                    "received_type": operation_type,
+                    "received_operation": file_operation.get('operation', 'unknown'),
+                    "full_analysis": analysis
+                }
+                
+                recovery_request: AgentExecutionRequest = {
+                    "task_id": f"recover_document_{task_id}",
+                    "task_description": f"Fix invalid document operation for: {task['description']}",
+                    "task_type": "analysis",
+                    "operation": "diagnose_error",
+                    "parameters": {
+                        "error_message": f"Document task failed: invalid operation specification (type='{operation_type}')",
+                        "task_context": error_context,
+                        "agent_type": "document_task",
+                        "suggestions": [
+                            "File operation should have type='document' (or 'docx'/'txt' for legacy)",
+                            "Operation should be 'create_docx', 'create_txt', 'append_docx', 'append_txt', 'read_docx', or 'read_txt'",
+                            "Parameters should include 'content' and optionally 'title', 'file_path'",
+                            "For create_docx: {\"content\": \"...\", \"title\": \"...\"}",
+                            "For create_txt: {\"content\": \"...\", \"encoding\": \"utf-8\"}"
+                        ]
+                    },
+                    "input_data": {},
+                    "temp_folder": str(self.config.folders.temp_path),
+                    "output_folder": str(self.config.folders.output_path),
+                    "cache_enabled": False,
+                    "blackboard": cast(list[dict[str, Any]], state.get('blackboard', [])),
+                    "relevant_entries": [],
+                    "max_retries": 1
+                }
+                
+                try:
+                    diagnose_response = cast(
+                        AgentExecutionResponse,
+                        self.problem_solver_agent.execute_task(recovery_request)
+                    )
+                    
+                    if diagnose_response.get('success'):
+                        recovery_result = diagnose_response.get('result', {})
+                        logger.info(f"[DOCUMENT AGENT] Recovery analysis: {recovery_result}")
+                        
+                        # Request human review instead of silent failure
+                        logger.info(f"[DOCUMENT AGENT] Requesting human review for task {task_id}")
+                        
+                        return {
+                            **state,
+                            "requires_human_review": True,
+                            "human_review_context": {
+                                "reason": f"Document task {task_id} requires human intervention to fix invalid operation specification",
+                                "error": f"Invalid document operation type: '{operation_type}'. Expected: {valid_types}",
+                                "task_id": task_id,
+                                "task_description": task['description'],
+                                "error_details": error_context,
+                                "recovery_suggestions": recovery_result,
+                                "original_analysis": analysis
+                            }
+                        }
+                    else:
+                        logger.error("[DOCUMENT AGENT] Recovery analysis also failed - proceeding with failure")
+                        
+                except Exception as recovery_error:
+                    logger.error(f"[DOCUMENT AGENT] Recovery attempt failed: {str(recovery_error)}")
+                    logger.log_exception("Document recovery exception:", recovery_error)
+                
+                # If recovery failed or wasn't attempted, mark task as failed with context
                 updated_task = {
                     **task,
                     "status": TaskStatus.FAILED,
-                    "error": "Invalid document operation specification - type must be 'docx' or 'txt'",
+                    "error": f"Invalid document operation specification - type must be one of {valid_types}",
+                    "error_details": error_context,
                     "updated_at": datetime.now().isoformat()
                 }
                 
@@ -2678,8 +2872,13 @@ class TaskManagerAgent:
             logger.info(f"[DOCUMENT AGENT] Parameters: {parameters}")
             logger.info("-" * 80)
             
+            # Filter relevant blackboard entries for context
+            blackboard = state.get('blackboard', [])
+            relevant_entries = self._filter_relevant_blackboard_entries(blackboard, task_id, "DOCUMENT AGENT")
+            
             # Create standardized AgentExecutionRequest
             logger.info(f"[DOCUMENT AGENT] Calling DocumentAgent.execute_task() with standardized request...")
+            logger.info(f"[DOCUMENT AGENT] Providing {len(relevant_entries)} relevant blackboard entries for context")
             request: AgentExecutionRequest = {
                 "task_id": task_id,
                 "task_description": task['description'],
@@ -2691,7 +2890,7 @@ class TaskManagerAgent:
                 "output_folder": str(self.config.folders.output_path),
                 "cache_enabled": True,
                 "blackboard": cast(list[dict[str, Any]], state.get('blackboard', [])),
-                "relevant_entries": [],
+                "relevant_entries": [self._generate_entry_id(e) for e in relevant_entries],
                 "max_retries": 3
             }
             
@@ -2819,10 +3018,58 @@ class TaskManagerAgent:
             blackboard = state.get('blackboard', [])
             
             # Extract relevant blackboard entries for this task
+            # For analysis tasks, be more inclusive to capture upstream data
+            task_prefix = '.'.join(task_id.split('.')[:-1]) if '.' in task_id else task_id
+            
+            def is_relevant_entry(entry: BlackboardEntry, current_task_id: str, prefix: str) -> bool:
+                """Check if blackboard entry is relevant to current analysis task."""
+                relevant_to = entry.get('relevant_to', [])
+                
+                # No specific relevance - available to all tasks
+                if not relevant_to:
+                    return True
+                
+                # Directly relevant to this task
+                if current_task_id in relevant_to:
+                    return True
+                
+                # For analysis tasks, include data from sibling/related tasks
+                # E.g., task 1.1.3 should see data from 1.1.1 and 1.1.2
+                for rel_task in relevant_to:
+                    # Same parent (sibling tasks)
+                    rel_prefix = '.'.join(rel_task.split('.')[:-1]) if '.' in rel_task else rel_task
+                    if rel_prefix == prefix:
+                        return True
+                    
+                    # Parent task data
+                    if current_task_id.startswith(rel_task + '.'):
+                        return True
+                    
+                    # Child task data (include data from subtasks)
+                    if rel_task.startswith(current_task_id + '.'):
+                        return True
+                
+                return False
+            
             relevant_entries = [
                 e for e in blackboard 
-                if task_id in e.get('relevant_to', []) or not e.get('relevant_to')
+                if is_relevant_entry(e, task_id, task_prefix)
             ]
+            
+            logger.info(f"[PROBLEM SOLVER] Total blackboard entries: {len(blackboard)}")
+            logger.info(f"[PROBLEM SOLVER] Filtered relevant entries: {len(relevant_entries)}")
+            logger.info(f"[PROBLEM SOLVER] Task ID for filtering: {task_id}")
+            logger.info(f"[PROBLEM SOLVER] Task prefix for filtering: {task_prefix}")
+            
+            # Log sample of what was filtered
+            if blackboard and not relevant_entries:
+                logger.warning(f"[PROBLEM SOLVER] ⚠️  All {len(blackboard)} entries were filtered out!")
+                sample_entries = blackboard[:3]
+                for idx, entry in enumerate(sample_entries, 1):
+                    logger.warning(f"[PROBLEM SOLVER]   Sample entry {idx}: relevant_to={entry.get('relevant_to', [])} source={entry.get('source_agent', 'unknown')}")
+            elif relevant_entries:
+                sample_sources = list(set([e.get('source_agent', 'unknown') for e in relevant_entries]))
+                logger.info(f"[PROBLEM SOLVER] Data sources in relevant entries: {sample_sources}")
             
             # Create analysis request for problem solver
             # Build data for analysis separately to avoid hashable type issues
@@ -2877,6 +3124,9 @@ Respond with JSON:
                 for entry in relevant_entries
             ]
             
+            logger.info(f"[PROBLEM SOLVER] Passing {len(relevant_entries_as_dicts)} relevant entries for analysis")
+            logger.info(f"[PROBLEM SOLVER] Data sources: {list(set([e.get('source_agent', 'unknown') for e in relevant_entries_as_dicts]))}")
+            
             request: AgentExecutionRequest = {
                 "task_id": task_id,
                 "task_description": task['description'],
@@ -2885,11 +3135,13 @@ Respond with JSON:
                 "parameters": {
                     "analysis_type": "comprehensive",
                     "data_sources": [e.get('source_agent', 'unknown') for e in relevant_entries],
-                    "depth_level": task.get('depth', 0)
+                    "depth_level": task.get('depth', 0),
+                    "objective": objective,
+                    "blackboard_entries": relevant_entries_as_dicts  # Pass blackboard entries in parameters
                 },
                 "input_data": {
                     "objective": objective,
-                    "blackboard_entries": relevant_entries_as_dicts
+                    "blackboard_entries": relevant_entries_as_dicts  # Also in input_data for backward compatibility
                 },
                 "temp_folder": state.get('metadata', {}).get('temp_folder', ''),
                 "output_folder": state.get('metadata', {}).get('output_folder', ''),
@@ -2900,7 +3152,7 @@ Respond with JSON:
             }
             
             logger.info("[PROBLEM SOLVER] Invoking ProblemSolverAgent...")
-            response_result = self.problem_solver_agent.execute_task(request=request)
+            response_result = self.problem_solver_agent.execute_task(request)
             
             # Handle both dict and AgentExecutionResponse formats
             response: AgentExecutionResponse | dict[str, Any]
@@ -3755,7 +4007,7 @@ Respond with JSON:
                     "max_retries": 1
                 }
                 
-                diagnose_response = cast(AgentExecutionResponse, self.problem_solver_agent.execute_task(request=diagnose_request))
+                diagnose_response = cast(AgentExecutionResponse, self.problem_solver_agent.execute_task(diagnose_request))
                 error_analysis = diagnose_response.get('result', {}) if diagnose_response['success'] else None
                 
                 if error_analysis:
@@ -3782,7 +4034,7 @@ Respond with JSON:
                     "max_retries": 1
                 }
                 
-                solution_response = cast(AgentExecutionResponse, self.problem_solver_agent.execute_task(request=solution_request))
+                solution_response = cast(AgentExecutionResponse, self.problem_solver_agent.execute_task(solution_request))
                 suggested_solutions = solution_response.get('result', {}) if solution_response['success'] else None
                 
                 if suggested_solutions:
@@ -3999,7 +4251,7 @@ Respond with JSON:
                                 "relevant_entries": [],
                                 "max_retries": 2
                             }
-                            interpret_response = cast(AgentExecutionResponse, self.problem_solver_agent.execute_task(request=interpret_request))
+                            interpret_response = cast(AgentExecutionResponse, self.problem_solver_agent.execute_task(interpret_request))
                             interpreted = interpret_response.get('result', {}) if interpret_response['success'] else None
                             
                             if interpreted and interpreted.get('success'):
@@ -4027,7 +4279,7 @@ Respond with JSON:
                                         "relevant_entries": [],
                                         "max_retries": 2
                                     }
-                                    format_response = cast(AgentExecutionResponse, self.problem_solver_agent.execute_task(request=format_request))
+                                    format_response = cast(AgentExecutionResponse, self.problem_solver_agent.execute_task(format_request))
                                     formatted = format_response.get('result', {}) if format_response['success'] else interpreted.get('parsed_data', raw_input)
                                     updated_context = json.dumps(formatted) if isinstance(formatted, dict) else str(formatted)
                                     logger.info(f"[HUMAN REVIEW] Formatted for {agent_type} agent")
@@ -4132,7 +4384,7 @@ Respond with JSON:
                                 "relevant_entries": [],
                                 "max_retries": 2
                             }
-                            interpret_output_response = cast(AgentExecutionResponse, self.problem_solver_agent.execute_task(request=interpret_output_request))
+                            interpret_output_response = cast(AgentExecutionResponse, self.problem_solver_agent.execute_task(interpret_output_request))
                             interpreted = interpret_output_response.get('result', {}) if interpret_output_response['success'] else None
                             
                             if interpreted and interpreted.get('success'):

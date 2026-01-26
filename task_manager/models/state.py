@@ -218,6 +218,7 @@ class AgentState(TypedDict):
     # ===== HUMAN INTERACTION =====
     requires_human_review: bool  # Flag for human intervention
     human_feedback: str  # Optional feedback from human
+    human_review_context: NotRequired[Dict[str, Any]]  # Context for human review workflows (error details, suggestions, etc)
     
     # ===== STATE MODIFICATION TRACKING =====
     last_updated_key: NotRequired[Optional[str]]  # Last state key that was modified (for debugging)
