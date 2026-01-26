@@ -546,7 +546,7 @@ class TaskManagerAgent:
         # Log all pending task IDs for tracking
         if pending_tasks:
             pending_ids = [t['id'] for t in pending_tasks]
-            logger.info(f"[SELECT] Pending task IDs: {pending_ids}")
+            logger.info(f"[SELECT] Pending task IDs (before sort): {pending_ids}")
         else:
             # Additional debugging if no pending tasks found
             logger.warning("[SELECT] No PENDING tasks found, checking task statuses:")
@@ -573,7 +573,24 @@ class TaskManagerAgent:
             logger.info("=" * 80)
             return {**state, "active_task_id": ""}
         
-        # Select first pending task (could implement priority logic here)
+        # SORT pending tasks by hierarchical numeric ID (e.g., 1.1.1, 1.1.2, 1.2.1)
+        def parse_task_id(task_id: str) -> List[int]:
+            """Parse task ID into numeric components for proper sorting."""
+            try:
+                # Extract numeric parts: "1.1.2" -> [1, 1, 2]
+                parts = task_id.split('.')
+                return [int(p) for p in parts if p.isdigit()]
+            except (ValueError, AttributeError):
+                logger.debug(f"[SELECT] Could not parse task ID: {task_id}")
+                return [999999]  # Put unparseable IDs at the end
+        
+        # Sort by numeric hierarchy
+        pending_tasks.sort(key=lambda t: parse_task_id(t['id']))
+        
+        sorted_ids = [t['id'] for t in pending_tasks]
+        logger.info(f"[SELECT] Pending task IDs (after sort): {sorted_ids}")
+        
+        # Select first pending task after sorting
         next_task = pending_tasks[0]
         logger.info(f"[SELECT] Selected task {next_task['id']}: {next_task['description'][:80]}...")
         logger.info(f"[SELECT] Task depth: {next_task.get('depth', 0)}")
@@ -1718,12 +1735,17 @@ class TaskManagerAgent:
         task_id = state['active_task_id']
         logger.info(f"🔹 Processing task_id: {task_id}")
         
+        # DEBUG: Log task details
         task = next(t for t in state['tasks'] if t['id'] == task_id)
+        logger.debug(f"[DEBUG] Task found: id={task['id']}, status={task.get('status')}, description={task.get('description', 'N/A')[:80]}")
+        logger.debug(f"[DEBUG] Task depth: {task.get('depth', 0)}, Task type: {task.get('type', 'N/A')}")
+        
         analysis = task.get('result') if isinstance(task, dict) else task['result']
         
         # Ensure analysis is a dict
         if not isinstance(analysis, dict):
             analysis = {}
+            logger.debug("[DEBUG] Analysis was not a dict, initialized to empty dict")
         
         logger.info("=" * 80)
         logger.info(f"[WEB SEARCH AGENT] EXECUTION STARTED")
@@ -1874,8 +1896,34 @@ class TaskManagerAgent:
                 "max_retries": 3
             }
             
-            # Execute using standardized interface
-            response = cast(AgentExecutionResponse, self.web_search_agent.execute_task(request=request))
+            # Execute using standardized interface (pass as positional arg to support dual-format handling)
+            logger.debug(f"[WEB SEARCH AGENT] Request object created")
+            logger.debug(f"[WEB SEARCH AGENT] Request keys: {list(request.keys())}")
+            logger.debug(f"[WEB SEARCH AGENT] Request operation: {request.get('operation')}, parameters keys: {list(request.get('parameters', {}).keys())}")
+            logger.debug(f"[WEB SEARCH AGENT] About to call execute_task with positional argument (request dict)")
+            
+            try:
+                response = cast(AgentExecutionResponse, self.web_search_agent.execute_task(request))
+                logger.debug(f"[WEB SEARCH AGENT] execute_task() returned successfully")
+                logger.debug(f"[WEB SEARCH AGENT] Response type: {type(response)}")
+                logger.debug(f"[WEB SEARCH AGENT] Response keys: {list(response.keys()) if isinstance(response, dict) else 'N/A'}")
+            except Exception as web_search_ex:
+                logger.error(f"[WEB SEARCH AGENT] ✗ EXCEPTION during execute_task(): {str(web_search_ex)}")
+                logger.error(f"[WEB SEARCH AGENT] Exception type: {type(web_search_ex).__name__}")
+                logger.error(f"[WEB SEARCH AGENT] Exception details: {web_search_ex}")
+                import traceback
+                logger.error(f"[WEB SEARCH AGENT] Traceback:\n{traceback.format_exc()}")
+                
+                # Create failure response
+                response = {
+                    'success': False,
+                    'result': {
+                        'error': str(web_search_ex),
+                        'exception_type': type(web_search_ex).__name__,
+                        'summary': '',
+                        'results_count': 0
+                    }
+                }
             
             # Extract legacy-compatible result_data from standardized response
             result_data = {
@@ -2020,12 +2068,21 @@ class TaskManagerAgent:
         except Exception as e:
             logger.error(f"[WEB SEARCH AGENT] ✗ FAILED: Error executing task")
             logger.error(f"[WEB SEARCH AGENT] Exception: {str(e)}")
+            logger.error(f"[WEB SEARCH AGENT] Exception Type: {type(e).__name__}")
+            logger.error(f"[WEB SEARCH AGENT] Task ID: {task_id}")
+            logger.error(f"[WEB SEARCH AGENT] Operation: {operation}")
+            logger.error(f"[WEB SEARCH AGENT] Parameters: {params}")
+            
+            # Get full traceback
+            import traceback
+            logger.error(f"[WEB SEARCH AGENT] Traceback:\n{traceback.format_exc()}")
             logger.info("=" * 80)
             
             updated_task = {
                 **task,
                 "status": TaskStatus.FAILED,
                 "error": str(e),
+                "error_type": type(e).__name__,
                 "updated_at": datetime.now().isoformat()
             }
             

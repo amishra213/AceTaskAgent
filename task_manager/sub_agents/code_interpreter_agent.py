@@ -504,16 +504,25 @@ Do not include any markdown formatting or explanations - just the raw Python cod
         """
         start_time = time.time()
         
+        # DEBUG LOGGING
+        logger.debug("=" * 80)
+        logger.debug(f"[{self.agent_name}] execute_task() called")
+        logger.debug(f"[{self.agent_name}] request type: {type(request)}")
+        logger.debug(f"[{self.agent_name}] request keys: {list(request.keys()) if isinstance(request, dict) else 'N/A'}")
+        logger.debug("=" * 80)
+        
         try:
             # Extract request parameters
             operation = request.get('operation', '')
             parameters = request.get('parameters', {})
             task_id = request.get('task_id', f"code_interpreter_{int(start_time * 1000)}")
             
-            logger.info(f"[{self.agent_name}] Executing operation: {operation}")
+            logger.info(f"[{self.agent_name}] Executing operation: {operation} for task_id: {task_id}")
+            logger.debug(f"[{self.agent_name}] Parameters: {list(parameters.keys())}")
             
             # Route to operation handlers
             if operation == "execute_analysis":
+                logger.debug(f"[{self.agent_name}] Routing to execute_analysis operation")
                 legacy_result = self.execute_analysis(
                     request=parameters.get('request', ''),
                     data_context=parameters.get('data_context'),
@@ -521,6 +530,7 @@ Do not include any markdown formatting or explanations - just the raw Python cod
                 )
             
             elif operation == "generate_code":
+                logger.debug(f"[{self.agent_name}] Routing to generate_code operation")
                 legacy_result = self._generate_code(
                     request=parameters.get('request', ''),
                     data_context=parameters.get('data_context'),
@@ -528,6 +538,7 @@ Do not include any markdown formatting or explanations - just the raw Python cod
                 )
             
             elif operation == "execute_code":
+                logger.debug(f"[{self.agent_name}] Routing to execute_code operation")
                 legacy_result = self._execute_code(
                     code=parameters.get('code', ''),
                     data_context=parameters.get('data_context'),
@@ -536,6 +547,7 @@ Do not include any markdown formatting or explanations - just the raw Python cod
             
             elif operation == "analyze_data":
                 # Alias for execute_analysis
+                logger.debug(f"[{self.agent_name}] Routing to analyze_data (alias for execute_analysis)")
                 legacy_result = self.execute_analysis(
                     request=parameters.get('request', ''),
                     data_context=parameters.get('data_context'),
@@ -543,6 +555,7 @@ Do not include any markdown formatting or explanations - just the raw Python cod
                 )
             
             else:
+                logger.error(f"[{self.agent_name}] Unknown operation: {operation}")
                 error_response = create_error_response(
                     error_code="UNKNOWN_OPERATION",
                     error_type="validation_error",

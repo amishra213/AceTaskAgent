@@ -1655,6 +1655,17 @@ class WebSearchAgent:
         Returns:
             Legacy dict OR AgentExecutionResponse based on input format
         """
+        # COMPREHENSIVE DEBUG LOGGING
+        logger.debug("=" * 80)
+        logger.debug("[WEB SEARCH AGENT] execute_task() called")
+        logger.debug(f"[WEB SEARCH AGENT] args count: {len(args)}")
+        logger.debug(f"[WEB SEARCH AGENT] kwargs keys: {list(kwargs.keys())}")
+        if args:
+            logger.debug(f"[WEB SEARCH AGENT] arg[0] type: {type(args[0])}")
+            if isinstance(args[0], dict):
+                logger.debug(f"[WEB SEARCH AGENT] arg[0] keys: {list(args[0].keys())}")
+        logger.debug("=" * 80)
+        
         start_time = time.time()
         return_legacy = True
         operation = None
@@ -1691,6 +1702,10 @@ class WebSearchAgent:
             logger.debug("Legacy keyword call")
         
         else:
+            # Enhanced error logging
+            logger.error(f"[WEB SEARCH AGENT] Invalid parameter format!")
+            logger.error(f"[WEB SEARCH AGENT] args: {args}")
+            logger.error(f"[WEB SEARCH AGENT] kwargs: {kwargs}")
             raise InvalidParameterError(
                 parameter_name="task",
                 message="Invalid call to execute_task. Use one of:\n"
@@ -1709,6 +1724,8 @@ class WebSearchAgent:
             # Ensure operation is not None
             if operation is None:
                 operation = "unknown"
+            
+            logger.debug(f"[WEB SEARCH AGENT] After parsing: task_id={task_id}, operation={operation}, params keys={list(parameters.keys())}")
             
             # Normalize operation aliases to standard operations
             operation_aliases = {
@@ -1747,8 +1764,12 @@ class WebSearchAgent:
                 parameters['max_results'] = parameters['num_results']
                 logger.debug(f"Mapped parameter 'num_results' to 'max_results'")
             
+            logger.debug(f"[WEB SEARCH AGENT] EXECUTING: operation={operation}, task_id={task_id}")
+            logger.debug(f"[WEB SEARCH AGENT] PARAMETERS: {parameters}")
+            
             # Execute the operation using existing methods
             if operation == "search":
+                logger.debug(f"[WEB SEARCH AGENT] Calling search() with query='{parameters.get('query', '')}', max_results={parameters.get('max_results', 10)}")
                 result = self.search(
                     query=parameters.get('query', ''),
                     max_results=parameters.get('max_results', 10),
@@ -1757,6 +1778,7 @@ class WebSearchAgent:
                 )
             
             elif operation == "scrape":
+                logger.debug(f"[WEB SEARCH AGENT] Calling scrape() with url='{parameters.get('url', '')}'")
                 result = self.scrape(
                     url=parameters.get('url', ''),
                     extract_text=parameters.get('extract_text', True),
@@ -1765,6 +1787,7 @@ class WebSearchAgent:
                 )
             
             elif operation == "smart_scrape":
+                logger.debug(f"[WEB SEARCH AGENT] Calling smart_scrape() with url='{parameters.get('url', '')}'")
                 result = self.smart_scrape(
                     url=parameters.get('url', ''),
                     wait_selector=parameters.get('wait_selector'),
@@ -1774,6 +1797,7 @@ class WebSearchAgent:
                 )
             
             elif operation == "capture_screenshot":
+                logger.debug(f"[WEB SEARCH AGENT] Calling capture_screenshot() with url='{parameters.get('url', '')}'")
                 result = self.capture_screenshot(
                     url=parameters.get('url', ''),
                     selector=parameters.get('selector'),
@@ -1782,6 +1806,7 @@ class WebSearchAgent:
                 )
             
             elif operation == "handle_pagination":
+                logger.debug(f"[WEB SEARCH AGENT] Calling handle_pagination() with url='{parameters.get('url', '')}'")
                 result = self.handle_pagination(
                     url=parameters.get('url', ''),
                     next_button_selector=parameters.get('next_button_selector', ''),
@@ -1790,6 +1815,7 @@ class WebSearchAgent:
                 )
             
             elif operation == "fetch":
+                logger.debug(f"[WEB SEARCH AGENT] Calling fetch() with url='{parameters.get('url', '')}'")
                 result = self.fetch(
                     url=parameters.get('url', ''),
                     save_to_file=parameters.get('save_to_file'),
@@ -1797,12 +1823,14 @@ class WebSearchAgent:
                 )
             
             elif operation == "summarize":
+                logger.debug(f"[WEB SEARCH AGENT] Calling summarize() with url='{parameters.get('url', '')}'")
                 result = self.summarize(
                     url=parameters.get('url', ''),
                     max_sentences=parameters.get('max_sentences', 5)
                 )
             
             elif operation == "deep_search":
+                logger.debug(f"[WEB SEARCH AGENT] Calling deep_search() with query='{parameters.get('query', '')}', target_url='{parameters.get('target_url') or parameters.get('url')}'")
                 result = self.deep_search(
                     query=parameters.get('query', ''),
                     target_url=parameters.get('target_url') or parameters.get('url'),
