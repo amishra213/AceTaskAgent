@@ -115,6 +115,9 @@ class EventBus:
         # Dead letter queue for failed events
         self.dead_letter_queue: List[tuple[SystemEvent, str]] = []
         
+        # Task relay agent (optional)
+        self.task_relay_agent: Optional[Any] = None
+        
         # Statistics
         self.stats = {
             "events_published": 0,
@@ -407,6 +410,265 @@ class EventBus:
                 return
         
         logger.warning(f"Event {event_id} not found in history")
+    
+    
+    # ========================================================================
+    # TASK RELAY INTEGRATION
+    # ========================================================================
+    
+    def register_task_relay_agent(self, relay_agent: Any) -> None:
+        """
+        Register a task relay agent with the event bus.
+        
+        The relay agent will handle task execution requests sent via events.
+        
+        Args:
+            relay_agent: TaskRelayAgent instance
+        """
+        self.task_relay_agent = relay_agent
+        logger.info("[EVENT_BUS] Task relay agent registered")
+        
+        # Subscribe to task execution requests
+        self.subscribe(
+            event_type="task_execution_request",
+            handler=self._handle_task_execution_request,
+            subscriber_name="event_bus_task_router",
+            priority=1  # High priority
+        )
+        logger.info("[EVENT_BUS] Task execution request handler registered")
+    
+    
+    def _handle_task_execution_request(self, event: SystemEvent) -> None:
+        """
+        Handle a task execution request event.
+        
+        This method is called when a task_execution_request event is published.
+        It extracts task details from the event and routes them to the relay agent.
+        
+        Args:
+            event: Task execution request event
+        """
+        try:
+            payload = event.get('payload', {})
+            task_id = payload.get('task_id', 'unknown')
+            
+            logger.info(f"[EVENT_BUS] Received task execution request for task {task_id}")
+            
+            if not hasattr(self, 'task_relay_agent') or self.task_relay_agent is None:
+                logger.error("[EVENT_BUS] Task relay agent not registered - cannot execute task")
+                
+                # Publish failure event
+                failure_event = create_system_event(
+                    event_type="task_execution_failed",
+                    event_category="task_lifecycle",
+                    source_agent="event_bus",
+                    payload={
+                        "task_id": task_id,
+                        "error": "Task relay agent not registered",
+                        "timestamp": datetime.now().isoformat()
+                    }
+                )
+                self.publish(failure_event)
+                return
+            
+            # Extract task parameters
+            task_description = payload.get('task_description', '')
+            task_type = payload.get('task_type', 'unknown')
+            operation = payload.get('operation', '')
+            parameters = payload.get('parameters', {})
+            input_data = payload.get('input_data', {})
+            temp_folder = payload.get('temp_folder', '')
+            output_folder = payload.get('output_folder', '')
+            cache_enabled = payload.get('cache_enabled', True)
+            blackboard = payload.get('blackboard', [])
+            relevant_entries = payload.get('relevant_entries', [])
+            max_retries = payload.get('max_retries', 3)
+            
+            logger.info(f"[EVENT_BUS] Task details: {task_type} / {operation}")
+            
+            # Execute task through relay agent
+            result = self.task_relay_agent.execute_task(
+                task_id=task_id,
+                task_description=task_description,
+                task_type=task_type,
+                operation=operation,
+                parameters=parameters,
+                input_data=input_data,
+                temp_folder=temp_folder,
+                output_folder=output_folder,
+                cache_enabled=cache_enabled,
+                blackboard=blackboard,
+                relevant_entries=relevant_entries,
+                max_retries=max_retries
+            )
+            
+            # Publish completion event with results
+            if result.success:
+                completion_event = create_system_event(
+                    event_type="task_execution_completed",
+                    event_category="task_lifecycle",
+                    source_agent="event_bus",
+                    payload={
+                        "task_id": result.task_id,
+                        "success": True,
+                        "agent_type": result.agent_type,
+                        "result_data": result.result_data,
+                        "execution_time_ms": result.execution_time_ms,
+                        "timestamp": datetime.now().isoformat()
+                    }
+                )
+                logger.info(f"[EVENT_BUS] Publishing task_execution_completed for task {task_id}")
+            else:
+                completion_event = create_system_event(
+                    event_type="task_execution_failed",
+                    event_category="task_lifecycle",
+                    source_agent="event_bus",
+                    payload={
+                        "task_id": result.task_id,
+                        "success": False,
+                        "agent_type": result.agent_type,
+                        "error": result.error,
+                        "execution_time_ms": result.execution_time_ms,
+                        "timestamp": datetime.now().isoformat()
+                    }
+                )
+                logger.info(f"[EVENT_BUS] Publishing task_execution_failed for task {task_id}")
+            
+            self.publish(completion_event)
+        
+        except Exception as e:
+            logger.error(f"[EVENT_BUS] Error handling task execution request: {str(e)}")
+            logger.exception(e)
+            
+            # Publish error event
+            error_event = create_system_event(
+                event_type="task_execution_failed",
+                event_category="task_lifecycle",
+                source_agent="event_bus",
+                payload={
+                    "task_id": payload.get('task_id', 'unknown'),
+                    "error": f"Task execution error: {str(e)}",
+                    "timestamp": datetime.now().isoformat()
+                }
+            )
+            self.publish(error_event)
+    
+    
+    def invoke_task_relay(
+        self,
+        task_id: str,
+        task_description: str,
+        task_type: str,
+        operation: str,
+        parameters: Dict[str, Any],
+        input_data: Dict[str, Any],
+        temp_folder: str,
+        output_folder: str,
+        cache_enabled: bool = True,
+        blackboard: Optional[List[Dict[str, Any]]] = None,
+        relevant_entries: Optional[List[str]] = None,
+        max_retries: int = 3
+    ) -> Dict[str, Any]:
+        """
+        Invoke task execution through the relay agent via event bus.
+        
+        This is a convenience method that publishes a task execution request
+        and waits for completion (synchronous interface over event bus).
+        
+        Args:
+            task_id: Task identifier
+            task_description: Task description
+            task_type: Type of task (determines which agent to use)
+            operation: Operation to perform
+            parameters: Operation parameters
+            input_data: Input data
+            temp_folder: Temporary folder
+            output_folder: Output folder
+            cache_enabled: Whether caching is enabled
+            blackboard: Current blackboard entries
+            relevant_entries: Relevant blackboard entry IDs
+            max_retries: Maximum retries
+        
+        Returns:
+            Result dictionary with execution status and data
+        """
+        import threading
+        import queue
+        
+        result_queue: queue.Queue = queue.Queue()
+        
+        # Create handler to capture task completion
+        def on_task_completion(event: SystemEvent):
+            result_queue.put(event.get('payload', {}))
+        
+        # Subscribe to completion for this task
+        def filter_for_task(event: SystemEvent) -> bool:
+            return event.get('payload', {}).get('task_id') == task_id
+        
+        subscription_id = self.subscribe(
+            event_type="task_execution_completed",
+            handler=on_task_completion,
+            filter_func=filter_for_task,
+            subscriber_name=f"task_relay_completion_handler_{task_id}",
+            priority=1
+        )
+        
+        # Also subscribe to failures
+        def on_task_failure(event: SystemEvent):
+            result_queue.put(event.get('payload', {}))
+        
+        failure_subscription_id = self.subscribe(
+            event_type="task_execution_failed",
+            handler=on_task_failure,
+            filter_func=filter_for_task,
+            subscriber_name=f"task_relay_failure_handler_{task_id}",
+            priority=1
+        )
+        
+        try:
+            # Publish task execution request
+            request_event = create_system_event(
+                event_type="task_execution_request",
+                event_category="task_lifecycle",
+                source_agent="workflow_manager",
+                payload={
+                    "task_id": task_id,
+                    "task_description": task_description,
+                    "task_type": task_type,
+                    "operation": operation,
+                    "parameters": parameters,
+                    "input_data": input_data,
+                    "temp_folder": temp_folder,
+                    "output_folder": output_folder,
+                    "cache_enabled": cache_enabled,
+                    "blackboard": blackboard or [],
+                    "relevant_entries": relevant_entries or [],
+                    "max_retries": max_retries,
+                    "timestamp": datetime.now().isoformat()
+                }
+            )
+            
+            logger.info(f"[EVENT_BUS] Publishing task execution request for task {task_id}")
+            self.publish(request_event)
+            
+            # Wait for result (with timeout)
+            timeout_seconds = 300  # 5 minute timeout
+            try:
+                result = result_queue.get(timeout=timeout_seconds)
+                logger.info(f"[EVENT_BUS] Received task result for {task_id}")
+                return result
+            except queue.Empty:
+                logger.error(f"[EVENT_BUS] Timeout waiting for task {task_id} result")
+                return {
+                    "task_id": task_id,
+                    "success": False,
+                    "error": f"Task execution timeout after {timeout_seconds}s"
+                }
+        
+        finally:
+            # Clean up subscriptions
+            self.unsubscribe(subscription_id)
+            self.unsubscribe(failure_subscription_id)
 
 
 # ============================================================================

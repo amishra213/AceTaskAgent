@@ -20,6 +20,7 @@ from task_manager.utils.rate_limiter import global_rate_limiter
 from task_manager.utils.input_context import InputContext
 from task_manager.utils.temp_manager import TempDataManager
 from task_manager.utils.redis_cache import RedisCacheManager
+from task_manager.utils.execution_tracer import ExecutionTracer
 from task_manager.utils.exceptions import (
     InvalidParameterError,
     MissingDependencyError
@@ -65,6 +66,19 @@ class TaskManagerAgent:
         
         logger.info(f"Initializing TaskManagerAgent with objective: {objective[:100]}...")
         logger.debug(f"Configuration: {self.config.to_dict()}")
+        
+        # Initialize Execution Tracer for comprehensive debugging
+        self.tracer = ExecutionTracer(enable_detailed_logging=True)
+        logger.info("[TRACER] Execution tracer initialized for detailed workflow diagnostics")
+        
+        # Initialize Health Checker for detecting hangs and failures
+        from task_manager.utils.state_validator import HealthChecker, StateValidator
+        self.health_checker = HealthChecker(
+            max_iterations=self.config.max_iterations,
+            timeout_seconds=600  # 10 minutes per node
+        )
+        self.state_validator = StateValidator()
+        logger.info("[HEALTH] Health checker initialized")
         
         # Initialize Temp Data Manager first - for organizing WIP data
         session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -125,6 +139,19 @@ class TaskManagerAgent:
         
         # Initialize ProblemSolverAgent for LLM-based error analysis and human input interpretation
         self.problem_solver_agent = ProblemSolverAgent(llm_client=self.llm)
+        
+        # Initialize TaskRelayAgent for centralized task orchestration
+        from task_manager.core.task_relay_agent import TaskRelayAgent
+        self.task_relay_agent = TaskRelayAgent(enable_tracing=True)
+        self.task_relay_agent.register_agent("pdf_agent", self.pdf_agent)
+        self.task_relay_agent.register_agent("excel_agent", self.excel_agent)
+        self.task_relay_agent.register_agent("ocr_image_agent", self.ocr_image_agent)
+        self.task_relay_agent.register_agent("web_search_agent", self.web_search_agent)
+        self.task_relay_agent.register_agent("code_interpreter_agent", self.code_interpreter_agent)
+        self.task_relay_agent.register_agent("document_agent", self.document_agent)
+        self.task_relay_agent.register_agent("data_extraction_agent", self.data_extraction_agent)
+        self.task_relay_agent.register_agent("problem_solver_agent", self.problem_solver_agent)
+        logger.info("[RELAY] Task relay agent initialized and all sub-agents registered")
         
         # Initialize Redis cache manager for task result caching
         self.cache = RedisCacheManager()
@@ -499,6 +526,48 @@ class TaskManagerAgent:
         print(">>> ENTERED _select_next_task", flush=True)
         logger.info(">>> ENTERED _select_next_task")
         
+        # Health checks to detect issues early
+        logger.info("[HEALTH] Running pre-execution health checks...")
+        try:
+            # Validate state integrity
+            is_valid, errors = self.state_validator.validate_state_integrity(state)
+            if not is_valid:
+                logger.error(f"[HEALTH] ✗ State integrity issues detected:")
+                for error in errors:
+                    logger.error(f"  • {error}")
+            else:
+                logger.info("[HEALTH] ✓ State integrity valid")
+            
+            # Check active task validity
+            active_valid, active_error = self.state_validator.validate_active_task(state)
+            if not active_valid and active_error:
+                logger.warning(f"[HEALTH] ⚠️  {active_error}")
+            
+            # Check for duplicates
+            duplicates = self.state_validator.check_task_duplication(state)
+            if duplicates:
+                logger.warning(f"[HEALTH] ⚠️  Duplicate task IDs in completed_task_ids: {duplicates}")
+            
+            # Check iteration limit
+            exceeded, msg = self.health_checker.check_iteration_limit(state.get('iteration_count', 0))
+            if exceeded:
+                logger.error(f"[HEALTH] ✗ {msg}")
+                return {
+                    **state,
+                    "requires_human_review": True,
+                    "human_feedback": f"Maximum iterations reached: {msg}"
+                }
+            
+            # Check task progress
+            progressing, progress_msg = self.health_checker.check_task_progress(state)
+            if not progressing and progress_msg:
+                logger.warning(f"[HEALTH] ⚠️  {progress_msg}")
+        
+        except Exception as health_error:
+            logger.error(f"[HEALTH] Error during health checks: {str(health_error)}")
+            logger.exception(health_error)
+            # Continue despite health check errors
+        
         # Check state health
         try:
             state_keys = list(state.keys())
@@ -613,19 +682,27 @@ class TaskManagerAgent:
         print(">>> ENTERED _analyze_task", flush=True)
         logger.info(">>> ENTERED _analyze_task")
         
+        # Record entry state snapshot
+        self.tracer.record_state_snapshot("analyze_task", dict(state), phase="entry")
+        
         task_id = state['active_task_id']
+        logger.info(f"[ANALYZE] Analyzing task: {task_id}")
+        self.tracer.record_routing_decision("analyze_task", task_id, "entry", "Starting analysis")
         
         if not task_id:
             logger.warning("[ANALYZE] No active_task_id - returning state unchanged")
+            self.tracer.record_routing_decision("analyze_task", "", "error", "No active task ID")
             return state
         
         try:
             task = next(t for t in state['tasks'] if t['id'] == task_id)
         except StopIteration:
             logger.error(f"[ANALYZE] Task {task_id} not found in tasks list!")
+            logger.error(f"[ANALYZE] Available tasks: {[t['id'] for t in state['tasks']]}")
+            self.tracer.record_routing_decision("analyze_task", task_id, "error", "Task not found in tasks list")
             return state
         
-        logger.info(f"[ANALYZE] Analyzing task {task_id}...")
+        logger.info(f"[ANALYZE] Found task {task_id}: {task.get('description', '')[:80]}")
         
         # DEPTH LIMIT ENFORCEMENT: Force execution at depth 2 or higher for research tasks
         current_depth = task.get('depth', 0)
@@ -676,11 +753,14 @@ class TaskManagerAgent:
             
             logger.info(f"[ANALYZE] ✓ Task {task_id} forced to execute - returning updated state")
             
-            return {
+            result_state: AgentState = {
                 **state,
                 "tasks": updated_tasks,
                 "requires_human_review": False
             }
+            
+            self.tracer.record_state_snapshot("analyze_task", dict(result_state), phase="exit", notes=f"Forced execution at depth {current_depth}")
+            return result_state
         
         # Build analysis prompt using PromptBuilder (with input context)
         analysis_prompt = PromptBuilder.build_analysis_prompt(
@@ -691,6 +771,8 @@ class TaskManagerAgent:
             depth_limit=depth_limit,
             input_context=state.get('input_context')
         )
+        
+        logger.debug(f"[ANALYZE] Built analysis prompt ({len(analysis_prompt)} chars)")
         
         try:
             response = self._rate_limited_invoke([
@@ -705,10 +787,13 @@ class TaskManagerAgent:
                 response_content = "".join(str(item) for item in response_content)
             response_content = str(response_content)
             
+            logger.debug(f"[ANALYZE] LLM response ({len(response_content)} chars): {response_content[:200]}")
+            
             # Parse response
             analysis = self._parse_json_response(response_content)
             
             logger.info(f"[ANALYZE] Result: {analysis['action']} - {analysis['reasoning']}")
+            self.tracer.record_routing_decision("analyze_task", task_id, analysis['action'], analysis['reasoning'], {"analysis": analysis})
             
             # Update task with analysis
             updated_task: Task = {
@@ -726,21 +811,34 @@ class TaskManagerAgent:
             
             logger.info(f"[ANALYZE] ✓ Task {task_id} analyzed - returning updated state")
             
-            return {
+            result_state = {
                 **state,
                 "tasks": updated_tasks,
                 "requires_human_review": analysis.get('requires_human_review', False)
             }
             
-        except Exception as e:
-            logger.error(f"[ANALYZE] Error: {str(e)}")
-            logger.exception(e)
+            self.tracer.record_state_snapshot("analyze_task", dict(result_state), phase="exit")
+            return result_state
+        
+        except Exception as llm_error:
+            logger.error(f"[ANALYZE] ✗ LLM invocation failed: {str(llm_error)}")
+            logger.error(f"[ANALYZE] Exception type: {type(llm_error).__name__}")
+            logger.exception(llm_error)
             
-            # Update task with error
+            # Fallback: Create default analysis to continue execution
+            logger.warning(f"[ANALYZE] FALLBACK: Creating default analysis to continue task execution")
+            fallback_analysis = {
+                "action": "execute_task",
+                "reasoning": f"LLM analysis failed ({type(llm_error).__name__}), using default execution",
+                "subtasks": None,
+                "estimated_complexity": "medium",
+                "requires_human_review": False
+            }
+            
             updated_task: Task = {
                 **task,
-                "status": TaskStatus.FAILED,
-                "error": str(e),
+                "status": TaskStatus.ANALYZING,
+                "result": fallback_analysis,
                 "updated_at": datetime.now().isoformat()
             }
             
@@ -749,13 +847,17 @@ class TaskManagerAgent:
                 for t in state['tasks']
             ]
             
-            logger.warning(f"[ANALYZE] ✗ Task {task_id} failed during analysis - returning error state")
+            logger.warning(f"[ANALYZE] ✓ Fallback analysis created for task {task_id}")
             
-            return {
+            result_state = {
                 **state,
                 "tasks": updated_tasks,
-                "failed_task_ids": [task_id]
             }
+            
+            self.tracer.record_state_snapshot("analyze_task", dict(result_state), phase="exit", notes=f"Fallback analysis due to: {type(llm_error).__name__}")
+            
+            # Don't re-raise - continue with fallback
+            return result_state
     
     
     def _breakdown_task(self, state: AgentState) -> AgentState:
@@ -3858,33 +3960,45 @@ Respond with JSON:
             Next node to execute
         """
         task_id = state['active_task_id']
+        logger.info(f"[ROUTE ENTRY] task_id={task_id}")
+        
+        # Record entry
+        self.tracer.record_state_snapshot("_route_with_chain_execution", dict(state), phase="entry")
         
         # Handle case where no more tasks are pending
         # This happens after breakdown fails or all tasks are completed
         if not task_id:
             logger.info("[ROUTE] No active task - all pending tasks completed")
+            logger.warning("[ROUTE] ⚠️  ANOMALY: routing to handle_error when no active task (should not happen)")
             # Don't route to handle_error; instead wait for next select_task
             # The workflow will handle completion check through aggregate_results
+            self.tracer.record_routing_decision("_route_with_chain_execution", "", "handle_error", "No active task ID")
             return "handle_error"  # Will be caught by select_task loop
         
         task = next((t for t in state['tasks'] if t['id'] == task_id), None)
         
         if not task:
             logger.error(f"[ROUTE] Task {task_id} not found in tasks list")
+            logger.error(f"[ROUTE]   Available task IDs: {[t['id'] for t in state['tasks']]}")
+            self.tracer.record_routing_decision("_route_with_chain_execution", task_id, "handle_error", "Task not found in tasks list")
             return "handle_error"
         
         if task['status'] == TaskStatus.FAILED:
             logger.warning(f"[ROUTE] Task {task_id} already marked as FAILED, handling error")
+            self.tracer.record_routing_decision("_route_with_chain_execution", task_id, "handle_error", "Task already failed")
             return "handle_error"
         
         analysis = task.get('result') if isinstance(task, dict) else task['result']
         if not isinstance(analysis, dict):
-            logger.error(f"[ROUTE] Task {task_id} has invalid analysis format (not dict)")
+            logger.error(f"[ROUTE] Task {task_id} has invalid analysis format (not dict): {type(analysis)}")
+            logger.error(f"[ROUTE]   Task result: {analysis}")
             analysis = {}
         
         action = analysis.get('action', 'handle_error')
         
         logger.info(f"[ROUTE] 🔥 DEBUG: Original action from analysis: '{action}'")
+        logger.info(f"[ROUTE]   Task description: {task.get('description', '')[:100]}")
+        logger.info(f"[ROUTE]   Task status: {task.get('status')}")
         
         # Normalize action names - handle variations from LLM responses
         # Map shorthand actions to their full execute_* equivalents
@@ -3917,44 +4031,57 @@ Respond with JSON:
         action = action_mapping.get(action, action)
         
         logger.info(f"[ROUTE] 🔥 DEBUG: Mapped action: '{action}'")
+        logger.info(f"[ROUTE]   All available routes: breakdown, execute_task, execute_pdf_task, execute_excel_task, execute_ocr_task, execute_web_search_task, execute_code_interpreter_task, execute_data_extraction_task, execute_document_task, handle_error, review")
         
         # Priority 1: Human review (if required and not breakdown)
         if state.get('requires_human_review', False) and action != "breakdown":
             logger.info(f"[ROUTE] Requiring human review for task {task_id}")
+            self.tracer.record_routing_decision("_route_with_chain_execution", task_id, "review", "Human review required")
             return "review"
         
         # Priority 2: Breakdown decomposition
-
         if action == "breakdown":
             logger.info(f"[ROUTE] Routing to breakdown for task {task_id}")
+            self.tracer.record_routing_decision("_route_with_chain_execution", task_id, "breakdown", "Breakdown requested")
             return "breakdown"
         
         # Priority 3: Execute-specific agent tasks
         if action == "execute_task":
             logger.info(f"[ROUTE] Routing to generic execute for task {task_id}")
+            self.tracer.record_routing_decision("_route_with_chain_execution", task_id, "execute_task", "Generic execution")
             return "execute_task"
         elif action == "execute_pdf_task":
             logger.info(f"[ROUTE] Routing to PDF task executor for {task_id}")
+            self.tracer.record_routing_decision("_route_with_chain_execution", task_id, "execute_pdf_task", "PDF execution")
             return "execute_pdf_task"
         elif action == "execute_excel_task":
             logger.info(f"[ROUTE] Routing to Excel task executor for {task_id}")
+            self.tracer.record_routing_decision("_route_with_chain_execution", task_id, "execute_excel_task", "Excel execution")
             return "execute_excel_task"
         elif action == "execute_ocr_task":
             logger.info(f"[ROUTE] Routing to OCR task executor for {task_id}")
+            self.tracer.record_routing_decision("_route_with_chain_execution", task_id, "execute_ocr_task", "OCR execution")
             return "execute_ocr_task"
         elif action == "execute_web_search_task":
             logger.info(f"[ROUTE] Routing to WebSearch task executor for {task_id}")
             logger.warning(f"[ROUTE] 🔥 DEBUG: About to return 'execute_web_search_task' for task {task_id}")
+            self.tracer.record_routing_decision("_route_with_chain_execution", task_id, "execute_web_search_task", "Web search execution")
             print(f">>> [ROUTE] Returning 'execute_web_search_task' for task {task_id}", flush=True)
             return "execute_web_search_task"
         elif action == "execute_code_interpreter_task":
             logger.info(f"[ROUTE] Routing to Code Interpreter task executor for {task_id}")
+            self.tracer.record_routing_decision("_route_with_chain_execution", task_id, "execute_code_interpreter_task", "Code interpreter execution")
             return "execute_code_interpreter_task"
         elif action == "execute_data_extraction_task":
             logger.info(f"[ROUTE] Routing to Data Extraction task executor for {task_id}")
+            self.tracer.record_routing_decision("_route_with_chain_execution", task_id, "execute_data_extraction_task", "Data extraction execution")
             return "execute_data_extraction_task"
         elif action == "execute_document_task":
             logger.info(f"[ROUTE] Routing to Document task executor for {task_id}")
+            logger.info(f"[ROUTE]   🔥 DEBUG: Routing to execute_document_task")
+            logger.info(f"[ROUTE]   Task: {task.get('description', '')[:100]}")
+            self.tracer.record_routing_decision("_route_with_chain_execution", task_id, "execute_document_task", "Document execution")
+            print(f">>> [ROUTE] Returning 'execute_document_task' for task {task_id}", flush=True)
             return "execute_document_task"
         else:
             logger.error(f"[ROUTE] ✗ UNKNOWN ACTION: Task {task_id}")
@@ -3967,6 +4094,7 @@ Respond with JSON:
             ]
             logger.error(f"[ROUTE]   Available actions: {available_agents}")
             logger.error(f"[ROUTE]   Routing to error handler for resolution")
+            self.tracer.record_routing_decision("_route_with_chain_execution", task_id, "handle_error", f"Unknown action: {action}")
             return "handle_error"
     
     
