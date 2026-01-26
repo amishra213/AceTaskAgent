@@ -98,6 +98,8 @@ class BlackboardEntry(TypedDict):
     file_pointers: NotRequired[Dict[str, str]]  # NEW: {agent: file_path, ...} for handoffs
     chain_next_agents: NotRequired[List[str]]  # NEW: Agents to execute next
     source_file_path: NotRequired[Optional[str]]  # NEW: Original file that was processed
+    last_modified_by: NotRequired[Optional[str]]  # NEW: Agent that last modified this entry
+    modification_log: NotRequired[List[str]]  # NEW: Modification history entries
 
 
 class PlanNode(TypedDict):
@@ -159,6 +161,7 @@ class AgentState(TypedDict):
     - Depth limiting to prevent infinite recursion
     - Nested blackboard entries for organized multi-level analysis
     - Input context from user-provided files
+    - State modification tracking for debugging and auditing
     
     Workflow:
     1. Plan defines the hierarchical structure
@@ -167,6 +170,7 @@ class AgentState(TypedDict):
     4. next_step determines which node executes next (enables non-linear flow)
     5. Context flows from parent to child for informed execution
     6. Input context provides access to user-provided data files
+    7. State changes are tracked with last_updated_key and change_log
     
     This allows agents to:
     - Share findings asynchronously via blackboard
@@ -176,6 +180,7 @@ class AgentState(TypedDict):
     - Make decisions based on collective knowledge
     - Preserve context across multiple decomposition levels
     - Access user-provided input files as data sources
+    - Track which sub-agent last modified the state for debugging
     """
     # ===== CORE METADATA =====
     objective: str  # Main goal/objective
@@ -213,3 +218,7 @@ class AgentState(TypedDict):
     # ===== HUMAN INTERACTION =====
     requires_human_review: bool  # Flag for human intervention
     human_feedback: str  # Optional feedback from human
+    
+    # ===== STATE MODIFICATION TRACKING =====
+    last_updated_key: NotRequired[Optional[str]]  # Last state key that was modified (for debugging)
+    change_log: NotRequired[List[str]]  # List of state modification events with timestamps

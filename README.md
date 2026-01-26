@@ -2,7 +2,7 @@
 
 A production-ready LangGraph-based orchestration system that recursively decomposes complex objectives and executes specialized sub-agents (PDF, Excel, OCR, WebSearch, CodeInterpreter) with intelligent coordination through blackboard pattern knowledge sharing.
 
-**Version**: 2.4 | **Status**: Production Ready ✅
+**Version**: 2.5 | **Status**: Production Ready ✅
 
 ## Features
 
@@ -17,6 +17,8 @@ A production-ready LangGraph-based orchestration system that recursively decompo
 - **Flexible API Configuration**: Generic LLM endpoint configuration for any provider (no vendor lock-in)
 - **Knowledge Sharing**: Blackboard pattern for findings across hierarchy levels
 - **State Persistence**: LangGraph checkpointing for fault tolerance
+- **🆕 Comprehensive Logging** (v2.5): Configurable log folder, file/console logging with rotation, structured logging
+- **🆕 Langfuse Observability** (v2.5): Full observability with traces, performance metrics, error tracking
 
 ## Quick Start
 
@@ -65,13 +67,87 @@ source .venv/bin/activate  # Windows: .venv\Scripts\activate
 # Install dependencies
 pip install langchain langchain-core python-dotenv langgraph
 
+# Install dependencies
+pip install langchain langchain-core python-dotenv langgraph
+
 # Choose LLM provider
 pip install langchain-anthropic      # Recommended
 # OR: pip install langchain-openai / langchain-google-genai
 
+# For observability (optional)
+pip install langfuse
+
+# Or install with all observability:
+# pip install task-manager-agent[observability]
+
 # Verify
 python -c "from task_manager import TaskManagerAgent; print('✓ Success')"
+
+# Setup logging (recommended)
+python setup_logging.py
 ```
+
+## Logging & Observability (v2.5)
+
+TaskManager now includes comprehensive logging with Langfuse integration for full observability.
+
+### Quick Setup
+
+```bash
+# 1. Configure logging in .env
+AGENT_LOG_FOLDER=./logs
+AGENT_LOG_LEVEL=INFO
+AGENT_ENABLE_FILE_LOGGING=true
+
+# 2. Run setup script
+python setup_logging.py
+
+# 3. Check logs in ./logs/
+```
+
+### Using Logs in Your Application
+
+```python
+from task_manager.config import EnvConfig
+from task_manager.utils import ComprehensiveLogger
+
+# Initialize logging
+EnvConfig.load_env_file()
+log_config = EnvConfig.get_logging_config()
+ComprehensiveLogger.initialize(**log_config)
+
+# Get logger
+logger = ComprehensiveLogger.get_logger(__name__)
+
+# Log with structured metadata
+logger.info("Operation completed", extra={
+    "operation": "data_processing",
+    "duration_ms": 1234,
+    "records_processed": 1000
+})
+
+# Log performance metrics
+logger.log_performance(
+    operation="database_query",
+    duration_seconds=1.23,
+    success=True
+)
+```
+
+### Enable Langfuse Observability (Optional)
+
+```bash
+# 1. Get API keys from https://langfuse.com/
+# 2. Add to .env:
+ENABLE_LANGFUSE=true
+LANGFUSE_PUBLIC_KEY=pk_...
+LANGFUSE_SECRET_KEY=sk_...
+
+# 3. Create traces in your code:
+trace = logger.create_trace("my_operation", metadata={"key": "value"})
+```
+
+**📖 Full Logging Guide**: See [LOGGING_GUIDE.md](LOGGING_GUIDE.md)
 
 ## Configuration
 
@@ -94,6 +170,11 @@ AGENT_LLM_PROVIDER=anthropic
 AGENT_LLM_MODEL=claude-sonnet-4-20250514
 AGENT_LLM_TEMPERATURE=0.2
 AGENT_LLM_MAX_TOKENS=2000
+
+# Logging Configuration (v2.5)
+AGENT_LOG_FOLDER=./logs
+AGENT_LOG_LEVEL=INFO
+ENABLE_LANGFUSE=false
 
 # Agent Settings
 AGENT_MAX_ITERATIONS=100
@@ -620,4 +701,4 @@ Contributions welcome:
 
 ---
 
-**TaskManager v2.4** | Production Ready ✅ | January 25, 2026
+**TaskManager v2.4** | Production Ready ✅

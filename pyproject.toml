@@ -18,15 +18,23 @@ dependencies = [
     "langgraph>=0.0.1",
     "langchain-anthropic>=0.1.0",
     "langchain-core>=0.1.0",
+    "redis>=5.0.0",
+    "python-dotenv>=1.0.0",
 ]
 
 [project.optional-dependencies]
+langfuse = [
+    "langfuse>=2.0.0",
+]
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
     "black>=23.0",
     "flake8>=6.0",
     "mypy>=1.0",
+]
+observability = [
+    "langfuse>=2.0.0",
 ]
 
 [tool.black]

@@ -5,6 +5,7 @@ Agent module - Main TaskManagerAgent implementation
 from typing import Literal, List, Optional, Dict, Any, Tuple
 from datetime import datetime
 import json
+import hashlib
 
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_anthropic import ChatAnthropic
@@ -17,6 +18,7 @@ from task_manager.utils.prompt_builder import PromptBuilder
 from task_manager.utils.rate_limiter import global_rate_limiter
 from task_manager.utils.input_context import InputContext
 from task_manager.utils.temp_manager import TempDataManager
+from task_manager.utils.redis_cache import RedisCacheManager
 from task_manager.sub_agents import (
     PDFAgent, ExcelAgent, OCRImageAgent, WebSearchAgent, 
     CodeInterpreterAgent, DataExtractionAgent
@@ -114,6 +116,13 @@ class TaskManagerAgent:
         self.web_search_agent = WebSearchAgent()
         self.code_interpreter_agent = CodeInterpreterAgent(llm=self.llm)
         # Note: data_extraction_agent already initialized above for context building
+        
+        # Initialize Redis cache manager for task result caching
+        self.cache = RedisCacheManager()
+        if self.cache.redis_available:
+            logger.info("[CACHE] Redis cache enabled - task results will be cached")
+        else:
+            logger.warning("[CACHE] Redis unavailable - caching disabled")
         
         # Initialize state
         self.initial_state = self._create_initial_state()
@@ -242,12 +251,100 @@ class TaskManagerAgent:
         Returns:
             LLM response
         """
+        import time
+        
+        # Log request details
+        logger.debug(f"[LLM] Preparing LLM invocation")
+        logger.debug(f"[LLM]   Provider: {self.config.llm.provider}")
+        logger.debug(f"[LLM]   Model: {self.config.llm.model_name}")
+        logger.debug(f"[LLM]   Messages: {len(messages)} items")
+        logger.debug(f"[LLM]   Temperature: {self.config.llm.temperature}")
+        
+        # Calculate total message content length for debugging
+        total_content_length = sum(
+            len(getattr(msg, 'content', str(msg))) for msg in messages
+        )
+        logger.debug(f"[LLM]   Total content size: {total_content_length} chars")
+        
         # Apply rate limiting before making the request
         wait_time = global_rate_limiter.wait()
         if wait_time > 0:
-            logger.debug(f"Rate limiter delayed LLM request by {wait_time:.2f}s")
+            logger.warning(f"[LLM] Rate limiter delayed request by {wait_time:.2f}s")
         
-        return self.llm.invoke(messages, **kwargs)
+        # Invoke LLM and measure latency
+        start_time = time.time()
+        try:
+            logger.debug(f"[LLM] Sending request to LLM endpoint...")
+            response = self.llm.invoke(messages, **kwargs)
+            
+            latency = time.time() - start_time
+            response_length = len(getattr(response, 'content', str(response)))
+            
+            logger.debug(f"[LLM] ✓ Response received")
+            logger.debug(f"[LLM]   Latency: {latency:.2f}s")
+            logger.debug(f"[LLM]   Response size: {response_length} chars")
+            
+            return response
+            
+        except Exception as e:
+            latency = time.time() - start_time
+            logger.error(f"[LLM] ✗ LLM invocation failed after {latency:.2f}s")
+            logger.error(f"[LLM]   Error type: {type(e).__name__}")
+            logger.error(f"[LLM]   Error message: {str(e)}")
+            raise
+    
+    
+    def _generate_cache_key(
+        self, 
+        task_description: str, 
+        agent_type: str, 
+        parameters: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """
+        Generate a deterministic cache key based on task content.
+        
+        Creates a hash from task description and parameters to ensure:
+        - Same task description = same cache key (cache hit)
+        - Different parameters = different cache key (cache isolation)
+        - Deterministic across multiple runs
+        
+        Args:
+            task_description: The task description text
+            agent_type: Type of agent (web_search, ocr, pdf, etc.)
+            parameters: Optional task parameters to include in hash
+            
+        Returns:
+            Cache key string in format: "task_<agent>_<hash>"
+            
+        Example:
+            key = _generate_cache_key(
+                "Search for Karnataka districts",
+                "web_search",
+                {"max_results": 10}
+            )
+            # Returns: "task_web_search_a3f5c8d9..."
+        """
+        # Normalize task description (lowercase, strip whitespace)
+        normalized_desc = task_description.lower().strip()
+        
+        # Create hashable content
+        hash_content = f"{agent_type}:{normalized_desc}"
+        
+        # Include parameters if provided (for cache isolation)
+        if parameters:
+            # Sort keys for deterministic hash
+            param_str = json.dumps(parameters, sort_keys=True)
+            hash_content += f":{param_str}"
+        
+        # Generate SHA256 hash (first 16 chars for readability)
+        hash_digest = hashlib.sha256(hash_content.encode('utf-8')).hexdigest()[:16]
+        
+        # Format: task_<agent>_<hash>
+        cache_key = f"task_{agent_type}_{hash_digest}"
+        
+        logger.debug(f"[CACHE KEY] Generated: {cache_key} for '{task_description[:50]}...'")
+        
+        return cache_key
     
     
     def _create_initial_state(self) -> AgentState:
@@ -369,6 +466,10 @@ class TaskManagerAgent:
     
     def _select_next_task(self, state: AgentState) -> AgentState:
         """Select next pending task to process."""
+        
+        # Immediate debug output
+        print(">>> ENTERED _select_next_task", flush=True)
+        logger.info(">>> ENTERED _select_next_task")
         
         # Log task hierarchy summary periodically (every 5 iterations)
         if state['iteration_count'] % 5 == 0 and state['iteration_count'] > 0:
@@ -1140,6 +1241,84 @@ class TaskManagerAgent:
             if source_images:
                 parameters['image_paths'] = source_images
             
+            # ============================================================
+            # CACHE CHECK: Look for cached OCR result
+            # ============================================================
+            # Use image paths as part of cache key for uniqueness
+            image_paths = parameters.get('image_paths', [])
+            cache_key = self._generate_cache_key(
+                task_description=task.get('description', ''),
+                agent_type="ocr",
+                parameters={"operation": operation, "image_count": len(image_paths)}
+            )
+            
+            cached_result = self.cache.get_cached_result(cache_key)
+            
+            if cached_result:
+                logger.info("=" * 80)
+                logger.info(f"[CACHE HIT] 🎯 Using cached OCR result")
+                logger.info(f"[CACHE HIT] Cache Key: {cache_key}")
+                logger.info(f"[CACHE HIT] Cached At: {cached_result['timestamp']}")
+                logger.info(f"[CACHE HIT] TTL Remaining: {cached_result['ttl']} seconds")
+                logger.info("=" * 80)
+                
+                # Use cached output data
+                result_data = cached_result['output']
+                task_success = result_data.get('success', True)
+                
+                # Mark task as completed with cached result
+                updated_task = {
+                    **task,
+                    "status": TaskStatus.COMPLETED if task_success else TaskStatus.FAILED,
+                    "result": result_data,
+                    "updated_at": datetime.now().isoformat(),
+                    "cached": True
+                }
+                
+                updated_tasks = [
+                    updated_task if t['id'] == task_id else t
+                    for t in state['tasks']
+                ]
+                
+                # Create blackboard entry for cached OCR result
+                blackboard_entry: BlackboardEntry = {
+                    "entry_type": "ocr_extraction_result_cached",
+                    "source_agent": "ocr_agent_cache",
+                    "source_task_id": task_id,
+                    "parent_task_id": None,  # type: ignore
+                    "content": {
+                        "operation": operation,
+                        "success": result_data.get('success'),
+                        "text_extracted": result_data.get('text', ''),
+                        "findings": result_data.get('findings', {}),
+                        "cache_hit": True,
+                        "cached_at": cached_result['timestamp']
+                    },
+                    "timestamp": datetime.now().isoformat(),
+                    "relevant_to": [task_id],
+                    "depth_level": 0,
+                    "file_pointers": {},  # type: ignore
+                    "chain_next_agents": []  # type: ignore
+                }
+                
+                logger.info(f"[OCR AGENT] ✓ Task {task_id} completed from cache")
+                
+                return {
+                    **state,
+                    "tasks": updated_tasks,  # type: ignore
+                    "results": {
+                        **state['results'],
+                        task_id: result_data
+                    },
+                    "blackboard": [blackboard_entry],
+                    "last_updated_key": "ocr_results"  # Trigger observer even for cached results
+                }
+            
+            # ============================================================
+            # CACHE MISS: Execute OCR normally
+            # ============================================================
+            logger.info(f"[CACHE MISS] No cached OCR result found - executing OCR")
+            
             logger.info(f"[OCR AGENT] Operation: {operation}")
             logger.info(f"[OCR AGENT] Image Count: {len(parameters.get('image_paths', []))}")
             logger.info(f"[OCR AGENT] Parameters: {parameters}")
@@ -1196,6 +1375,30 @@ class TaskManagerAgent:
                 }
                 blackboard_entry["chain_next_agents"] = ["excel_agent"]  # type: ignore
             
+            # ============================================================
+            # CACHE STORAGE: Store successful OCR result in Redis cache
+            # ============================================================
+            task_success = result_data.get('success', False)
+            if task_success:
+                cache_success = self.cache.cache_task_result(
+                    task_id=cache_key,
+                    input_data={
+                        "description": task.get('description', ''),
+                        "operation": operation,
+                        "image_paths": parameters.get('image_paths', []),
+                        "image_count": len(parameters.get('image_paths', []))
+                    },
+                    output_data=result_data,
+                    agent_type="ocr"
+                )
+                
+                if cache_success:
+                    logger.info(f"[CACHE STORAGE] ✓ OCR result cached: {cache_key}")
+                else:
+                    logger.debug(f"[CACHE STORAGE] Cache storage skipped or failed")
+            else:
+                logger.debug(f"[CACHE STORAGE] Skipping cache for failed OCR task")
+            
             return {
                 **state,
                 "tasks": updated_tasks,  # type: ignore
@@ -1203,7 +1406,8 @@ class TaskManagerAgent:
                     **state['results'],
                     task_id: result_data
                 },
-                "blackboard": [blackboard_entry]  # Only new entry - LangGraph will concatenate
+                "blackboard": [blackboard_entry],  # Only new entry - LangGraph will concatenate
+                "last_updated_key": "ocr_results"  # Observer trigger for auto-synthesis
             }
         
         except Exception as e:
@@ -1272,6 +1476,82 @@ class TaskManagerAgent:
             # Ensure query is always set - use task description as fallback
             if not params.get('query'):
                 params['query'] = task.get('description', '')
+            
+            # ============================================================
+            # CACHE CHECK: Look for cached result before executing
+            # ============================================================
+            cache_key = self._generate_cache_key(
+                task_description=task.get('description', ''),
+                agent_type="web_search",
+                parameters={"query": params.get('query', ''), "operation": operation}
+            )
+            
+            cached_result = self.cache.get_cached_result(cache_key)
+            
+            if cached_result:
+                logger.info("=" * 80)
+                logger.info(f"[CACHE HIT] 🎯 Using cached web search result")
+                logger.info(f"[CACHE HIT] Cache Key: {cache_key}")
+                logger.info(f"[CACHE HIT] Cached At: {cached_result['timestamp']}")
+                logger.info(f"[CACHE HIT] TTL Remaining: {cached_result['ttl']} seconds")
+                logger.info("=" * 80)
+                
+                # Use cached output data
+                result_data = cached_result['output']
+                task_success = result_data.get('success', True)
+                
+                # Mark task as completed with cached result
+                updated_task = {
+                    **task,
+                    "status": TaskStatus.COMPLETED if task_success else TaskStatus.FAILED,
+                    "result": result_data,
+                    "updated_at": datetime.now().isoformat(),
+                    "cached": True  # Flag to indicate this was from cache
+                }
+                
+                updated_tasks = [
+                    updated_task if t['id'] == task_id else t
+                    for t in state['tasks']
+                ]
+                
+                # Create blackboard entry for cached result
+                blackboard_entry: BlackboardEntry = {
+                    "entry_type": "web_search_result_cached",
+                    "source_agent": "web_search_agent_cache",
+                    "source_task_id": task_id,
+                    "content": {
+                        "operation": operation,
+                        "success": result_data.get('success'),
+                        "query": params.get('query', ''),
+                        "results_count": result_data.get('results_count', 0),
+                        "summary": result_data.get('summary', ''),
+                        "cache_hit": True,
+                        "cached_at": cached_result['timestamp']
+                    },
+                    "timestamp": datetime.now().isoformat(),
+                    "relevant_to": [task_id],
+                    "depth_level": 0,
+                    "file_pointers": {},  # type: ignore
+                    "chain_next_agents": []  # type: ignore
+                }
+                
+                logger.info(f"[WEB SEARCH AGENT] ✓ Task {task_id} completed from cache")
+                
+                return {
+                    **state,
+                    "tasks": updated_tasks,  # type: ignore
+                    "results": {
+                        **state['results'],
+                        task_id: result_data
+                    },
+                    "blackboard": [blackboard_entry],
+                    "last_updated_key": "web_findings"  # Trigger observer even for cached results
+                }
+            
+            # ============================================================
+            # CACHE MISS: Execute task normally
+            # ============================================================
+            logger.info(f"[CACHE MISS] No cached result found - executing web search")
             
             # Intelligent operation selection: use deep_search for:
             # 1. Tasks with specific URLs that need data extraction
@@ -1408,6 +1688,29 @@ class TaskManagerAgent:
             logger.info(f"[WEB SEARCH AGENT] Next step: aggregate_results → completion check")
             logger.info("=" * 80)
             
+            # ============================================================
+            # CACHE STORAGE: Store successful result in Redis cache
+            # ============================================================
+            if task_success:
+                cache_success = self.cache.cache_task_result(
+                    task_id=cache_key,
+                    input_data={
+                        "description": task.get('description', ''),
+                        "query": params.get('query', ''),
+                        "operation": operation,
+                        "parameters": params
+                    },
+                    output_data=result_data,
+                    agent_type="web_search"
+                )
+                
+                if cache_success:
+                    logger.info(f"[CACHE STORAGE] ✓ Result cached: {cache_key}")
+                else:
+                    logger.debug(f"[CACHE STORAGE] Cache storage skipped or failed")
+            else:
+                logger.debug(f"[CACHE STORAGE] Skipping cache for failed task")
+            
             return {
                 **state,
                 "tasks": updated_tasks,  # type: ignore
@@ -1415,7 +1718,8 @@ class TaskManagerAgent:
                     **state['results'],
                     task_id: result_data
                 },
-                "blackboard": [blackboard_entry]  # Only new entry - LangGraph will concatenate
+                "blackboard": [blackboard_entry],  # Only new entry - LangGraph will concatenate
+                "last_updated_key": "web_findings"  # Observer trigger for auto-synthesis
             }
         
         except Exception as e:
@@ -2210,6 +2514,188 @@ Format your response as JSON:
             }
     
     
+    def _auto_synthesis(self, state: AgentState) -> AgentState:
+        """
+        Auto-Synthesis Observer Node: Event-driven reactive analysis.
+        
+        This node implements the Observer pattern, automatically triggering when
+        specific state changes occur (OCR results or web search findings).
+        
+        Purpose:
+        - Provides immediate context-aware analysis when new data arrives
+        - Creates preliminary insights before full synthesis
+        - Enables reactive workflows where data triggers analysis
+        - Reduces latency between data collection and insight generation
+        
+        Triggered by:
+        - state['last_updated_key'] == 'ocr_results': OCR agent extracted text/tables
+        - state['last_updated_key'] == 'web_findings': WebSearch agent found data
+        
+        Workflow:
+        1. Detect which type of data triggered this node
+        2. Extract relevant blackboard entries
+        3. Perform focused analysis on the new data
+        4. Post preliminary insights to blackboard
+        5. Route back to aggregate_results to continue normal flow
+        
+        Args:
+            state: Current agent state with last_updated_key set
+            
+        Returns:
+            Updated state with auto-synthesis entry in blackboard
+        """
+        logger.info("="*70)
+        logger.info("🔔 AUTO-SYNTHESIS OBSERVER: Event-Driven Analysis Triggered")
+        logger.info("="*70)
+        
+        try:
+            trigger_key = state.get('last_updated_key', '')
+            objective = state.get('objective', '')
+            blackboard = state.get('blackboard', [])
+            
+            logger.info(f"[AUTO-SYNTHESIS] Trigger: {trigger_key}")
+            logger.info(f"[AUTO-SYNTHESIS] Blackboard entries: {len(blackboard)}")
+            
+            # Determine trigger type and extract relevant data
+            if trigger_key == 'ocr_results':
+                logger.info("[AUTO-SYNTHESIS] 🖼️ OCR Results detected - analyzing extracted content")
+                
+                # Find most recent OCR entry
+                ocr_entries = [e for e in reversed(blackboard) if e.get('source_agent') == 'ocr_agent']
+                if not ocr_entries:
+                    logger.warning("[AUTO-SYNTHESIS] No OCR entries found despite trigger")
+                    return state
+                
+                latest_ocr = ocr_entries[0]
+                ocr_content = latest_ocr.get('content', {})
+                
+                analysis_prompt = f"""You are analyzing freshly extracted OCR data in real-time.
+
+OBJECTIVE: {objective}
+
+OCR EXTRACTION RESULTS:
+- Text Extracted: {len(ocr_content.get('text_extracted', ''))} characters
+- Success: {ocr_content.get('success')}
+- Findings: {json.dumps(ocr_content.get('findings', {}), indent=2)}
+
+Your task:
+1. Identify key information extracted from the image/document
+2. Assess relevance to the objective
+3. Flag any important tables, numbers, or structured data
+4. Note any quality issues or extraction limitations
+5. Suggest immediate next steps (e.g., "extracted table should be analyzed by Excel agent")
+
+Respond with JSON:
+{{
+  "summary": "Brief summary of what was extracted",
+  "key_insights": ["insight 1", "insight 2"],
+  "data_quality": "HIGH/MEDIUM/LOW with explanation",
+  "structured_data_found": true or false,
+  "suggested_next_actions": ["action 1", "action 2"],
+  "relevance_to_objective": "How this data helps achieve the objective"
+}}"""
+            
+            elif trigger_key == 'web_findings':
+                logger.info("[AUTO-SYNTHESIS] 🌐 Web Search Results detected - analyzing findings")
+                
+                # Find most recent web search entry
+                web_entries = [e for e in reversed(blackboard) if e.get('source_agent') == 'web_search_agent']
+                if not web_entries:
+                    logger.warning("[AUTO-SYNTHESIS] No web search entries found despite trigger")
+                    return state
+                
+                latest_web = web_entries[0]
+                web_content = latest_web.get('content', {})
+                
+                analysis_prompt = f"""You are analyzing freshly collected web search data in real-time.
+
+OBJECTIVE: {objective}
+
+WEB SEARCH RESULTS:
+- Query: {web_content.get('query', '')}
+- Results Count: {web_content.get('results_count', 0)}
+- Pages Visited: {web_content.get('pages_visited', 0)}
+- Summary: {web_content.get('summary', '')}
+- Top Findings: {json.dumps(web_content.get('findings', [])[:5], indent=2)}
+
+Your task:
+1. Assess the quality and relevance of search results
+2. Identify key data points, metrics, or facts found
+3. Note any gaps or areas needing deeper investigation
+4. Compare against objective requirements
+5. Suggest follow-up searches or data extraction needs
+
+Respond with JSON:
+{{
+  "summary": "Brief summary of search findings",
+  "key_data_points": ["data point 1", "data point 2"],
+  "credibility_assessment": "Assessment of source quality",
+  "coverage_gaps": ["gap 1", "gap 2"],
+  "suggested_next_actions": ["action 1", "action 2"],
+  "relevance_to_objective": "How these findings help achieve the objective"
+}}"""
+            
+            else:
+                logger.warning(f"[AUTO-SYNTHESIS] Unknown trigger: {trigger_key}")
+                return state
+            
+            # Call LLM for reactive analysis
+            logger.info("[AUTO-SYNTHESIS] Calling LLM for event-driven analysis...")
+            response = self._rate_limited_invoke([
+                SystemMessage(content="You are a reactive analysis system that provides immediate insights when new data arrives. Respond only with valid JSON."),
+                HumanMessage(content=analysis_prompt)
+            ])
+            
+            # Extract and parse response
+            response_content = response.content if hasattr(response, 'content') else str(response)
+            if isinstance(response_content, list):
+                response_content = "".join(str(item) for item in response_content)
+            response_content = str(response_content)
+            
+            analysis_result = self._parse_json_response(response_content)
+            
+            logger.info("[AUTO-SYNTHESIS] ✓ Reactive analysis complete")
+            logger.info(f"[AUTO-SYNTHESIS] Key insights: {len(analysis_result.get('key_insights', analysis_result.get('key_data_points', [])))}")
+            
+            # Create auto-synthesis blackboard entry
+            auto_synthesis_entry: BlackboardEntry = {
+                "entry_type": "auto_synthesis_result",
+                "source_agent": "auto_synthesis_observer",
+                "source_task_id": "auto_synthesis",
+                "content": {
+                    "trigger": trigger_key,
+                    "objective": objective,
+                    "analysis": analysis_result,
+                    "timestamp": datetime.now().isoformat()
+                },
+                "timestamp": datetime.now().isoformat(),
+                "relevant_to": ["reactive_analysis"],
+                "depth_level": 0,
+                "file_pointers": {},  # type: ignore
+                "chain_next_agents": []  # type: ignore
+            }
+            
+            logger.info("[AUTO-SYNTHESIS] Posting reactive insights to blackboard")
+            logger.info(f"[AUTO-SYNTHESIS] Summary: {analysis_result.get('summary', 'N/A')[:150]}")
+            logger.info("="*70)
+            
+            return {
+                **state,
+                "blackboard": [auto_synthesis_entry],  # Only new entry - LangGraph will concatenate
+                "last_updated_key": None  # Clear trigger to prevent re-firing
+            }
+        
+        except Exception as e:
+            logger.error(f"[AUTO-SYNTHESIS] Error during auto-synthesis: {str(e)}")
+            logger.exception(e)
+            
+            # Don't fail the workflow - just log and continue
+            return {
+                **state,
+                "last_updated_key": None  # Clear trigger
+            }
+    
+    
     def _handle_error(self, state: AgentState) -> AgentState:
         """Handle task errors with retry logic."""
         task_id = state['active_task_id']
@@ -2829,12 +3315,14 @@ Format your response as JSON:
         final_state: AgentState = self.initial_state
         
         try:
+            stream_count = 0
             for state in self.app.stream(self.initial_state, config):
+                stream_count += 1
                 # state is a dict with node name as key
                 try:
                     node_name = list(state.keys())[0]
                     logger.info(f"🔷 GRAPH NODE EXECUTED: {node_name}")
-                    print(f"🔷 GRAPH NODE EXECUTED: {node_name}")  # Also print to stdout
+                    print(f"🔷 GRAPH NODE EXECUTED: {node_name}", flush=True)  # Also print to stdout with flush
                     
                     result = list(state.values())[0]
                     if isinstance(result, dict):
@@ -2845,18 +3333,29 @@ Format your response as JSON:
                     # Continue to next state
             
             # If we exit the loop normally, log it
-            logger.info("🔷 GRAPH STREAM ENDED NORMALLY")
-            print("🔷 GRAPH STREAM ENDED NORMALLY")
+            logger.info(f"🔷 GRAPH STREAM ENDED NORMALLY after {stream_count} nodes")
+            print(f"🔷 GRAPH STREAM ENDED NORMALLY after {stream_count} nodes", flush=True)
                     
+        except StopIteration:
+            logger.info("🔷 GRAPH STREAM STOPPED (StopIteration)")
+            print("🔷 GRAPH STREAM STOPPED (StopIteration)", flush=True)
+        except GeneratorExit:
+            logger.warning("🔷 GRAPH STREAM GENERATOR EXIT")
+            print("🔷 GRAPH STREAM GENERATOR EXIT", flush=True)
+        except KeyboardInterrupt:
+            logger.warning("🔷 GRAPH STREAM INTERRUPTED BY USER")
+            print("🔷 GRAPH STREAM INTERRUPTED BY USER", flush=True)
         except Exception as e:
             logger.error("=" * 80)
             logger.error("🚨 CRITICAL ERROR IN WORKFLOW EXECUTION")
             logger.error("=" * 80)
+            logger.error(f"Exception Type: {type(e).__name__}")
             logger.error(f"Exception: {str(e)}")
             logger.exception(e)
             logger.error("=" * 80)
             logger.error("Workflow terminated unexpectedly. Returning last known state.")
             logger.error("=" * 80)
+            print(f"🚨 CRITICAL ERROR: {type(e).__name__}: {str(e)}", flush=True)
         
         # Log final task hierarchy summary
         logger.info("")

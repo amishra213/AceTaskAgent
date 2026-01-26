@@ -207,3 +207,25 @@ AGENT_AUTO_CREATE_FOLDERS=true
         }
         
         return templates.get(llm_provider, templates["anthropic"])
+    
+    @staticmethod
+    def get_logging_config() -> Dict[str, Any]:
+        """
+        Get logging configuration from environment variables.
+        
+        Returns:
+            Dictionary with logging configuration
+        """
+        return {
+            "log_folder": os.getenv("AGENT_LOG_FOLDER", "./logs"),
+            "log_level": os.getenv("AGENT_LOG_LEVEL", "INFO"),
+            "enable_console": os.getenv("AGENT_ENABLE_CONSOLE_LOGGING", "true").lower() in ("true", "1", "yes"),
+            "enable_file": os.getenv("AGENT_ENABLE_FILE_LOGGING", "true").lower() in ("true", "1", "yes"),
+            "enable_langfuse": os.getenv("ENABLE_LANGFUSE", "false").lower() in ("true", "1", "yes"),
+            "langfuse_public_key": os.getenv("LANGFUSE_PUBLIC_KEY"),
+            "langfuse_secret_key": os.getenv("LANGFUSE_SECRET_KEY"),
+            "langfuse_host": os.getenv("LANGFUSE_HOST"),
+            "max_bytes": EnvConfig.get_int("AGENT_LOG_MAX_BYTES", 10485760),
+            "backup_count": EnvConfig.get_int("AGENT_LOG_BACKUP_COUNT", 5),
+        }
+

@@ -369,6 +369,13 @@ class MasterPlanner:
         blackboard = blackboard.copy() if blackboard else []
         blackboard.append(entry)
         
+        logger.debug(f"[BLACKBOARD] Posting finding to blackboard")
+        logger.debug(f"[BLACKBOARD]   Type: {entry_type}")
+        logger.debug(f"[BLACKBOARD]   Source: {source_agent} (task {source_task_id})")
+        logger.debug(f"[BLACKBOARD]   Content size: {len(str(content))} chars")
+        logger.debug(f"[BLACKBOARD]   Relevant to: {len(relevant_to or [])} task(s)")
+        logger.debug(f"[BLACKBOARD]   Blackboard size: {len(blackboard)} entries")
+        
         logger.info(
             f"Posted {entry_type} to blackboard from {source_agent} "
             f"(relevant to {len(relevant_to or [])} tasks)"
@@ -420,6 +427,14 @@ class MasterPlanner:
         
         blackboard = blackboard.copy() if blackboard else []
         blackboard.append(entry)
+        
+        logger.debug(f"[BLACKBOARD] Posting nested finding to blackboard")
+        logger.debug(f"[BLACKBOARD]   Type: {entry_type}")
+        logger.debug(f"[BLACKBOARD]   Source: {source_agent} (task {source_task_id})")
+        logger.debug(f"[BLACKBOARD]   Parent: {parent_task_id}")
+        logger.debug(f"[BLACKBOARD]   Depth: {depth_level}")
+        logger.debug(f"[BLACKBOARD]   Content size: {len(str(content))} chars")
+        logger.debug(f"[BLACKBOARD]   Blackboard size: {len(blackboard)} entries")
         
         logger.info(
             f"Posted nested {entry_type} to blackboard (depth {depth_level}) "
@@ -496,16 +511,25 @@ class MasterPlanner:
         Returns:
             Filtered blackboard entries
         """
+        logger.debug(f"[BLACKBOARD] Querying blackboard")
+        logger.debug(f"[BLACKBOARD]   Total entries: {len(blackboard or [])}")
+        logger.debug(f"[BLACKBOARD]   Filters: type={entry_type}, agent={source_agent}, task={task_id}")
+        
         results = blackboard or []
         
         if entry_type:
             results = [e for e in results if e['entry_type'] == entry_type]
+            logger.debug(f"[BLACKBOARD]   After type filter: {len(results)} entries")
         
         if source_agent:
             results = [e for e in results if e['source_agent'] == source_agent]
+            logger.debug(f"[BLACKBOARD]   After agent filter: {len(results)} entries")
         
         if task_id:
             results = [e for e in results if task_id in e.get('relevant_to', [])]
+            logger.debug(f"[BLACKBOARD]   After task filter: {len(results)} entries")
+        
+        logger.debug(f"[BLACKBOARD] ✓ Query complete: {len(results)} result(s)")
         
         logger.debug(
             f"Blackboard query: type={entry_type}, agent={source_agent}, "

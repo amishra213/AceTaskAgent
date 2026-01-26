@@ -158,6 +158,10 @@ def main():
     
     try:
         # Create agent
+        import uuid
+        session_id = f"session-{uuid.uuid4().hex[:8]}"
+        print(f"[SESSION] Starting with thread_id: {session_id}")
+        
         agent = TaskManagerAgent(
             objective=objective,
             config=config,
@@ -166,7 +170,7 @@ def main():
         
         # Run the agent with human review handling
         # The agent will pause at human_review node and we detect this
-        final_state = agent.run(thread_id="main-task-001")
+        final_state = agent.run(thread_id=session_id)
         
         # The agent workflow handles human review internally now
         # Just display the final results

@@ -65,3 +65,6 @@ examples/test_llm_client_providers.py
 examples/test_websearch_comprehensive.py
 examples/vision_analysis_examples.py
 temp_folder/trends_analysis.xlsx
+output_folder/research_results_20260125_212447.md
+examples/logging_observability_example.py
+examples/test_redis_cache.py

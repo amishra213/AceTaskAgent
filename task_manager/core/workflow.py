@@ -70,6 +70,7 @@ class WorkflowBuilder:
         workflow.add_node("aggregate_results", self.agent._aggregate_results)
         workflow.add_node("synthesize_research", self.agent._synthesize_research)
         workflow.add_node("agentic_debate", self.agent._agentic_debate)  # NEW: debate node for consensus validation
+        workflow.add_node("auto_synthesis", self.agent._auto_synthesis)  # NEW: observer node for event-driven analysis
         workflow.add_node("handle_error", self.agent._handle_error)
         workflow.add_node("human_review", self.agent._request_human_review)
         
@@ -128,20 +129,24 @@ class WorkflowBuilder:
         )
         
         # OCR → Excel: If OCR finds table data, Excel processes it
+        # OCR → Auto-Synthesis: If OCR results trigger observer pattern
         workflow.add_conditional_edges(
             "execute_ocr_task",
-            lambda state: "execute_excel_task" if self._should_chain_to_excel(state) else "aggregate_results",
+            self._route_after_ocr_execution,
             {
+                "auto_synthesis": "auto_synthesis",
                 "execute_excel_task": "execute_excel_task",
                 "aggregate_results": "aggregate_results"
             }
         )
         
         # WebSearch → Excel: If WebSearch created CSV, Excel processes it
+        # WebSearch → Auto-Synthesis: If web findings trigger observer pattern
         workflow.add_conditional_edges(
             "execute_web_search_task",
-            lambda state: "execute_excel_task" if self._should_chain_to_excel(state) else "aggregate_results",
+            self._route_after_websearch_execution,
             {
+                "auto_synthesis": "auto_synthesis",
                 "execute_excel_task": "execute_excel_task",
                 "aggregate_results": "aggregate_results"
             }
@@ -162,6 +167,9 @@ class WorkflowBuilder:
         
         # Data extraction always goes to aggregate (context building stage)
         workflow.add_edge("execute_data_extraction_task", "aggregate_results")
+        
+        # Auto-synthesis always goes to aggregate (observer pattern completes)
+        workflow.add_edge("auto_synthesis", "aggregate_results")
         
         # After aggregation, route to synthesis if all tasks complete
         # This enables multi-level research synthesis with conflict detection
@@ -353,8 +361,22 @@ class WorkflowBuilder:
         logger.info("[ROUTING] Calling _check_completion for final decision...")
         completion_result = self.agent._check_completion(state)
         logger.info(f"[ROUTING] Decision: {completion_result}")
+        logger.info(f"[ROUTING] Decision type: {type(completion_result)}")
         logger.info("=" * 80)
-        return completion_result  # type: ignore
+        
+        # Ensure we return a valid literal string, not something else
+        if completion_result == "continue":
+            logger.info("[ROUTING] Returning 'continue' → will route to select_task")
+            return "continue"
+        elif completion_result == "complete":
+            logger.info("[ROUTING] Returning 'complete' → will route to END")
+            return "complete"
+        elif completion_result == "max_iterations":
+            logger.info("[ROUTING] Returning 'max_iterations' → will route to END")
+            return "max_iterations"
+        else:
+            logger.warning(f"[ROUTING] Unexpected completion result: {completion_result}, defaulting to continue")
+            return "continue"
     
     def _route_to_debate_or_completion(self, state: "AgentState") -> Literal["debate", "continue", "complete", "max_iterations"]:
         """
@@ -509,3 +531,69 @@ class WorkflowBuilder:
                 return True
         
         return False
+
+    def _route_after_ocr_execution(self, state: "AgentState") -> Literal["auto_synthesis", "execute_excel_task", "aggregate_results"]:
+        """
+        Observer pattern routing after OCR execution.
+        
+        Priority routing:
+        1. If last_updated_key == 'ocr_results' → auto_synthesis (observer trigger)
+        2. If table data extracted → execute_excel_task (chain execution)
+        3. Otherwise → aggregate_results (normal flow)
+        
+        This implements event-driven triggers where OCR results automatically
+        trigger synthesis before continuing with normal workflow.
+        
+        Args:
+            state: Current agent state
+            
+        Returns:
+            Route destination node name
+        """
+        # Check for observer trigger first (highest priority)
+        last_updated_key = state.get('last_updated_key', '')
+        if last_updated_key == 'ocr_results':
+            logger.info("[OBSERVER ROUTING] 🔔 OCR results trigger detected → routing to auto_synthesis")
+            return "auto_synthesis"
+        
+        # Check for chain execution (second priority)
+        if self._should_chain_to_excel(state):
+            logger.info("[CHAIN ROUTING] 🔗 OCR extracted table → routing to execute_excel_task")
+            return "execute_excel_task"
+        
+        # Default to normal aggregation flow
+        logger.info("[NORMAL ROUTING] OCR complete → routing to aggregate_results")
+        return "aggregate_results"
+    
+    def _route_after_websearch_execution(self, state: "AgentState") -> Literal["auto_synthesis", "execute_excel_task", "aggregate_results"]:
+        """
+        Observer pattern routing after WebSearch execution.
+        
+        Priority routing:
+        1. If last_updated_key == 'web_findings' → auto_synthesis (observer trigger)
+        2. If CSV file generated → execute_excel_task (chain execution)
+        3. Otherwise → aggregate_results (normal flow)
+        
+        This implements event-driven triggers where web search findings automatically
+        trigger synthesis before continuing with normal workflow.
+        
+        Args:
+            state: Current agent state
+            
+        Returns:
+            Route destination node name
+        """
+        # Check for observer trigger first (highest priority)
+        last_updated_key = state.get('last_updated_key', '')
+        if last_updated_key == 'web_findings':
+            logger.info("[OBSERVER ROUTING] 🔔 Web findings trigger detected → routing to auto_synthesis")
+            return "auto_synthesis"
+        
+        # Check for chain execution (second priority)
+        if self._should_chain_to_excel(state):
+            logger.info("[CHAIN ROUTING] 🔗 WebSearch created CSV → routing to execute_excel_task")
+            return "execute_excel_task"
+        
+        # Default to normal aggregation flow
+        logger.info("[NORMAL ROUTING] WebSearch complete → routing to aggregate_results")
+        return "aggregate_results"
