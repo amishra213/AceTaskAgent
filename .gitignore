@@ -68,3 +68,4 @@ temp_folder/trends_analysis.xlsx
 output_folder/research_results_20260125_212447.md
 examples/logging_observability_example.py
 examples/test_redis_cache.py
+temp_folder/trend_analysis_template.xlsx
