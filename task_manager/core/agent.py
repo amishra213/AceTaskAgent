@@ -565,7 +565,7 @@ class TaskManagerAgent:
         
         except Exception as health_error:
             logger.error(f"[HEALTH] Error during health checks: {str(health_error)}")
-            logger.exception(health_error)
+            logger.log_exception("Health check exception:", health_error)
             # Continue despite health check errors
         
         # Check state health
@@ -677,7 +677,15 @@ class TaskManagerAgent:
     
     
     def _analyze_task(self, state: AgentState) -> AgentState:
-        """Analyze current task using LLM to decide next action."""
+        """
+        Analyze current task using LLM to decide next action.
+        
+        Enhanced with:
+        - Comprehensive error recovery using ProblemSolverAgent
+        - Automatic retry with adjusted prompts on failure
+        - Human review workflow for persistent failures
+        - Robust result validation
+        """
         # IMMEDIATE LOGGING - to detect if this method is even being called
         print(">>> ENTERED _analyze_task", flush=True)
         logger.info(">>> ENTERED _analyze_task")
@@ -719,20 +727,27 @@ class TaskManagerAgent:
         
         if current_depth >= force_execution_depth:
             logger.warning(f"[ANALYZE] Task at depth {current_depth} ({'research' if is_research_task else 'general'}) - FORCING EXECUTION to prevent infinite breakdown")
-            # Force web_search_task execution for research tasks
-            analysis = {
-                "action": "web_search_task",
-                "reasoning": f"Task at depth {current_depth} - forcing execution to prevent excessive decomposition",
-                "subtasks": None,
-                "search_query": task.get('description', ''),
-                "file_operation": {
+            # Force execute_web_search_task execution for research tasks or execute_problem_solver_task for analysis
+            if is_research_task:
+                action_name = "execute_web_search_task"
+                file_op = {
                     "type": "web_search",
                     "operation": "search",
                     "parameters": {
                         "query": task.get('description', ''),
                         "num_results": 5
                     }
-                },
+                }
+            else:
+                action_name = "execute_problem_solver_task"
+                file_op = None
+            
+            analysis = {
+                "action": action_name,
+                "reasoning": f"Task at depth {current_depth} - forcing execution to prevent excessive decomposition",
+                "subtasks": None,
+                "search_query": task.get('description', '') if is_research_task else None,
+                "file_operation": file_op,
                 "estimated_complexity": "medium",
                 "requires_human_review": False
             }
@@ -774,90 +789,172 @@ class TaskManagerAgent:
         
         logger.debug(f"[ANALYZE] Built analysis prompt ({len(analysis_prompt)} chars)")
         
-        try:
-            response = self._rate_limited_invoke([
-                SystemMessage(content="You are a task analysis expert. Respond only with valid JSON."),
-                HumanMessage(content=analysis_prompt)
-            ])
-            
-            # Extract content from response (handle different response types)
-            response_content = response.content if hasattr(response, 'content') else str(response)
-            if isinstance(response_content, list):
-                # If content is a list, join it
-                response_content = "".join(str(item) for item in response_content)
-            response_content = str(response_content)
-            
-            logger.debug(f"[ANALYZE] LLM response ({len(response_content)} chars): {response_content[:200]}")
-            
-            # Parse response
-            analysis = self._parse_json_response(response_content)
-            
-            logger.info(f"[ANALYZE] Result: {analysis['action']} - {analysis['reasoning']}")
-            self.tracer.record_routing_decision("analyze_task", task_id, analysis['action'], analysis['reasoning'], {"analysis": analysis})
-            
-            # Update task with analysis
-            updated_task: Task = {
-                **task,
-                "status": TaskStatus.ANALYZING,
-                "result": analysis,
-                "updated_at": datetime.now().isoformat()
-            }
-            
-            # Update tasks list
-            updated_tasks: List[Task] = [
-                updated_task if t['id'] == task_id else t
-                for t in state['tasks']
-            ]
-            
-            logger.info(f"[ANALYZE] ✓ Task {task_id} analyzed - returning updated state")
-            
-            result_state = {
-                **state,
-                "tasks": updated_tasks,
-                "requires_human_review": analysis.get('requires_human_review', False)
-            }
-            
-            self.tracer.record_state_snapshot("analyze_task", dict(result_state), phase="exit")
-            return result_state
+        # Track analysis attempts for retry logic
+        max_analysis_retries = 2
+        last_error = None
         
-        except Exception as llm_error:
-            logger.error(f"[ANALYZE] ✗ LLM invocation failed: {str(llm_error)}")
-            logger.error(f"[ANALYZE] Exception type: {type(llm_error).__name__}")
-            logger.exception(llm_error)
+        for attempt in range(1, max_analysis_retries + 1):
+            try:
+                logger.info(f"[ANALYZE] Analysis attempt {attempt}/{max_analysis_retries}")
+                
+                response = self._rate_limited_invoke([
+                    SystemMessage(content="You are a task analysis expert. Respond only with valid JSON."),
+                    HumanMessage(content=analysis_prompt)
+                ])
+                
+                # Extract content from response (handle different response types)
+                response_content = response.content if hasattr(response, 'content') else str(response)
+                if isinstance(response_content, list):
+                    # If content is a list, join it
+                    response_content = "".join(str(item) for item in response_content)
+                response_content = str(response_content)
+                
+                logger.debug(f"[ANALYZE] LLM response ({len(response_content)} chars): {response_content[:200]}")
+                
+                # Parse response
+                analysis = self._parse_json_response(response_content)
+                
+                # VALIDATE analysis result
+                if not isinstance(analysis, dict):
+                    raise ValueError(f"Analysis result is not a dict: {type(analysis)}")
+                
+                if 'action' not in analysis:
+                    raise ValueError("Analysis missing 'action' field")
+                
+                if 'reasoning' not in analysis:
+                    raise ValueError("Analysis missing 'reasoning' field")
+                
+                # Validate that action is meaningful
+                valid_actions = ['breakdown', 'execute_task', 'execute_pdf_task', 'execute_excel_task', 
+                               'execute_ocr_task', 'execute_web_search_task', 'execute_code_interpreter_task',
+                               'execute_data_extraction_task', 'execute_problem_solver_task', 'execute_document_task']
+                if analysis['action'] not in valid_actions:
+                    raise ValueError(f"Invalid action '{analysis['action']}'. Valid actions: {valid_actions}")
+                
+                logger.info(f"[ANALYZE] Result: {analysis['action']} - {analysis['reasoning']}")
+                logger.info(f"[ANALYZE] ✓ Analysis validation passed")
+                self.tracer.record_routing_decision("analyze_task", task_id, analysis['action'], analysis['reasoning'], {"analysis": analysis})
+                
+                # Update task with analysis
+                updated_task: Task = {
+                    **task,
+                    "status": TaskStatus.ANALYZING,
+                    "result": analysis,
+                    "updated_at": datetime.now().isoformat()
+                }
+                
+                # Update tasks list
+                updated_tasks: List[Task] = [
+                    updated_task if t['id'] == task_id else t
+                    for t in state['tasks']
+                ]
+                
+                logger.info(f"[ANALYZE] ✓ Task {task_id} analyzed successfully - returning updated state")
+                
+                result_state = {
+                    **state,
+                    "tasks": updated_tasks,
+                    "requires_human_review": analysis.get('requires_human_review', False)
+                }
+                
+                self.tracer.record_state_snapshot("analyze_task", dict(result_state), phase="exit")
+                return result_state
+                
+            except Exception as llm_error:
+                last_error = llm_error
+                logger.warning(f"[ANALYZE] Attempt {attempt} failed: {type(llm_error).__name__}: {str(llm_error)}")
+                logger.log_exception("Analysis attempt exception:", llm_error)
+                
+                if attempt < max_analysis_retries:
+                    logger.warning(f"[ANALYZE] Retrying analysis (attempt {attempt + 1}/{max_analysis_retries})...")
+                    # Continue to next attempt
+                    continue
+                else:
+                    # All retries exhausted
+                    logger.error(f"[ANALYZE] ✗ All {max_analysis_retries} analysis attempts failed")
+                    break
+        
+        # If we get here, all analysis attempts failed - invoke error recovery workflow
+        logger.error(f"[ANALYZE] ✗ Analysis failed after {max_analysis_retries} attempts: {str(last_error)}")
+        logger.error(f"[ANALYZE] Invoking LLM-based error diagnosis and human review workflow")
+        
+        # Use ProblemSolverAgent to diagnose the analysis failure
+        error_analysis = None
+        suggested_solutions = None
+        
+        try:
+            logger.info(f"[ANALYZE] Invoking ProblemSolverAgent for error diagnosis...")
             
-            # Fallback: Create default analysis to continue execution
-            logger.warning(f"[ANALYZE] FALLBACK: Creating default analysis to continue task execution")
-            fallback_analysis = {
-                "action": "execute_task",
-                "reasoning": f"LLM analysis failed ({type(llm_error).__name__}), using default execution",
-                "subtasks": None,
-                "estimated_complexity": "medium",
-                "requires_human_review": False
+            error_context = {
+                'task_id': task_id,
+                'task_description': task.get('description', ''),
+                'analysis_prompt': analysis_prompt[:500],  # Include first 500 chars of prompt
+                'error_message': str(last_error)
             }
             
-            updated_task: Task = {
-                **task,
-                "status": TaskStatus.ANALYZING,
-                "result": fallback_analysis,
-                "updated_at": datetime.now().isoformat()
+            # Diagnose the error
+            diagnose_request: AgentExecutionRequest = {
+                "task_id": f"diagnose_analysis_{task_id}",
+                "task_description": "Diagnose analysis failure",
+                "task_type": "atomic",
+                "operation": "diagnose_error",
+                "parameters": {
+                    "error_message": str(last_error),
+                    "task_context": error_context,
+                    "agent_type": "analysis"
+                },
+                "input_data": {},
+                "temp_folder": str(self.config.folders.temp_path),
+                "output_folder": str(self.config.folders.output_path),
+                "cache_enabled": False,
+                "blackboard": cast(list[dict[str, Any]], state.get('blackboard', [])),
+                "relevant_entries": [],
+                "max_retries": 1
             }
             
-            updated_tasks: List[Task] = [
-                updated_task if t['id'] == task_id else t
-                for t in state['tasks']
-            ]
+            diagnose_response = cast(AgentExecutionResponse, self.problem_solver_agent.execute_task(request=diagnose_request))
+            error_analysis = diagnose_response.get('result', {}) if diagnose_response['success'] else None
             
-            logger.warning(f"[ANALYZE] ✓ Fallback analysis created for task {task_id}")
+            if error_analysis:
+                logger.info(f"[ANALYZE] Error diagnosis: category={error_analysis.get('error_category')}")
+                logger.info(f"[ANALYZE] Solution suggestion: {error_analysis.get('solution_prompt', 'Unknown')[:100]}...")
             
-            result_state = {
-                **state,
-                "tasks": updated_tasks,
-            }
-            
-            self.tracer.record_state_snapshot("analyze_task", dict(result_state), phase="exit", notes=f"Fallback analysis due to: {type(llm_error).__name__}")
-            
-            # Don't re-raise - continue with fallback
-            return result_state
+        except Exception as e:
+            logger.warning(f"[ANALYZE] ProblemSolverAgent diagnosis failed: {str(e)}")
+            logger.log_exception("Error diagnosis exception:", e)
+        
+        # Mark task as FAILED with error analysis for human review
+        updated_task: Task = {
+            **task,
+            "status": TaskStatus.FAILED,
+            "error": f"Analysis failed after {max_analysis_retries} attempts: {str(last_error)}",
+            "result": {
+                "error": str(last_error),
+                "error_analysis": error_analysis,
+                "error_type": type(last_error).__name__
+            },
+            "updated_at": datetime.now().isoformat()
+        }
+        
+        updated_tasks: List[Task] = [
+            updated_task if t['id'] == task_id else t
+            for t in state['tasks']
+        ]
+        
+        logger.warning(f"[ANALYZE] Task {task_id} marked as FAILED for human review")
+        
+        # Return state with task marked as failed and requires_human_review set
+        # This will trigger the error recovery workflow in routing
+        result_state = {
+            **state,
+            "tasks": updated_tasks,
+            "failed_task_ids": [task_id],  # Add to failed tasks
+            "active_task_id": "",  # Clear active task to trigger selection
+            "requires_human_review": True  # Flag for human review workflow
+        }
+        
+        self.tracer.record_state_snapshot("analyze_task", dict(result_state), phase="exit", notes=f"Analysis failed and marked for human review")
+        return result_state
     
     
     def _breakdown_task(self, state: AgentState) -> AgentState:
@@ -2669,7 +2766,228 @@ class TaskManagerAgent:
             logger.error(f"[DOCUMENT AGENT] ✗ FAILED: Error executing task")
             logger.error(f"[DOCUMENT AGENT] Exception type: {type(e).__name__}")
             logger.error(f"[DOCUMENT AGENT] Exception message: {str(e)}")
-            logger.exception(e)
+            logger.log_exception("Document agent exception:", e)
+            logger.info("=" * 80)
+            
+            updated_task = {
+                **task,
+                "status": TaskStatus.FAILED,
+                "error": str(e),
+                "updated_at": datetime.now().isoformat()
+            }
+            
+            updated_tasks = [
+                updated_task if t['id'] == task_id else t
+                for t in state['tasks']
+            ]
+            
+            return {
+                **state,
+                "tasks": updated_tasks,  # type: ignore
+                "failed_task_ids": [task_id]
+            }
+    
+    
+    def _execute_problem_solver_task(self, state: AgentState) -> AgentState:
+        """
+        Execute an analysis/problem-solving task using ProblemSolverAgent.
+        
+        This handles tasks that require deep analysis, synthesis, or comparison of data,
+        such as "Analyze each trend comprehensively" or "Compare findings".
+        
+        The problem solver analyzes blackboard data and existing task results
+        to provide insights and conclusions.
+        """
+        task_id = state['active_task_id']
+        task = next(t for t in state['tasks'] if t['id'] == task_id)
+        analysis = task.get('result') if isinstance(task, dict) else task['result']
+        
+        # Ensure analysis is a dict
+        if not isinstance(analysis, dict):
+            analysis = {}
+        
+        logger.info("=" * 80)
+        logger.info(f"[PROBLEM SOLVER] EXECUTION STARTED")
+        logger.info("=" * 80)
+        logger.info(f"Task ID: {task_id}")
+        logger.info(f"Description: {task['description'][:100]}...")
+        logger.info(f"Depth Level: {task.get('depth', 0)}")
+        
+        try:
+            # Build analysis prompt using existing blackboard data
+            objective = state.get('objective', '')
+            blackboard = state.get('blackboard', [])
+            
+            # Extract relevant blackboard entries for this task
+            relevant_entries = [
+                e for e in blackboard 
+                if task_id in e.get('relevant_to', []) or not e.get('relevant_to')
+            ]
+            
+            # Create analysis request for problem solver
+            # Build data for analysis separately to avoid hashable type issues
+            analysis_data = [
+                {
+                    'source': e.get('source_agent', 'unknown'),
+                    'type': e.get('entry_type', 'unknown'),
+                    'content': e.get('content', {})
+                }
+                for e in relevant_entries[:10]  # Limit to last 10 entries for clarity
+            ]
+            
+            analysis_prompt = f"""You are a problem solver tasked with comprehensive analysis.
+
+OBJECTIVE: {objective}
+
+TASK: {task['description']}
+
+CONTEXT:
+{json.dumps(state.get('metadata', {}), indent=2)}
+
+AVAILABLE DATA FOR ANALYSIS:
+{json.dumps(analysis_data, indent=2)}
+
+Your task:
+1. Analyze the available data comprehensively
+2. Identify key insights, patterns, and relationships
+3. Compare different data sources and findings
+4. Synthesize into clear conclusions
+5. Flag any contradictions or areas needing clarification
+
+Respond with JSON:
+{{
+  "analysis": "Detailed analysis of the data",
+  "key_insights": ["insight 1", "insight 2", ...],
+  "patterns_identified": ["pattern 1", "pattern 2", ...],
+  "contradictions": ["contradiction 1", ...] or [],
+  "recommendations": ["recommendation 1", "recommendation 2", ...],
+  "confidence_level": "HIGH/MEDIUM/LOW"
+}}"""
+            
+            logger.info("[PROBLEM SOLVER] Building analysis request...")
+            
+            # Create execution request for task relay
+            # Convert BlackboardEntry objects to dicts for the request
+            blackboard_as_dicts: list[dict[str, Any]] = [
+                dict(entry) if isinstance(entry, dict) else {**entry}  # type: ignore
+                for entry in blackboard
+            ]
+            relevant_entries_as_dicts: list[dict[str, Any]] = [
+                dict(entry) if isinstance(entry, dict) else {**entry}  # type: ignore
+                for entry in relevant_entries
+            ]
+            
+            request: AgentExecutionRequest = {
+                "task_id": task_id,
+                "task_description": task['description'],
+                "task_type": "analysis",
+                "operation": "analyze_task",
+                "parameters": {
+                    "analysis_type": "comprehensive",
+                    "data_sources": [e.get('source_agent', 'unknown') for e in relevant_entries],
+                    "depth_level": task.get('depth', 0)
+                },
+                "input_data": {
+                    "objective": objective,
+                    "blackboard_entries": relevant_entries_as_dicts
+                },
+                "temp_folder": state.get('metadata', {}).get('temp_folder', ''),
+                "output_folder": state.get('metadata', {}).get('output_folder', ''),
+                "cache_enabled": state.get('metadata', {}).get('cache_enabled', True),
+                "blackboard": blackboard_as_dicts,
+                "relevant_entries": [e.get('id', '') for e in relevant_entries],
+                "max_retries": 2
+            }
+            
+            logger.info("[PROBLEM SOLVER] Invoking ProblemSolverAgent...")
+            response_result = self.problem_solver_agent.execute_task(request=request)
+            
+            # Handle both dict and AgentExecutionResponse formats
+            response: AgentExecutionResponse | dict[str, Any]
+            if isinstance(response_result, dict):
+                response = response_result
+            else:
+                response = response_result  # type: ignore
+            
+            logger.info(f"[PROBLEM SOLVER] ✓ Agent execution completed")
+            logger.info(f"[PROBLEM SOLVER]   Success: {response.get('success')}")
+            logger.info(f"[PROBLEM SOLVER]   Execution time: {response.get('execution_time_ms', 0)}ms")
+            
+            # Extract results
+            success = response.get('success', False)
+            result_data = response.get('result', {})
+            error = response.get('error', None)
+            
+            if success:
+                # Create blackboard entry for analysis results
+                analysis_entry: BlackboardEntry = {
+                    "entry_type": "problem_solver_analysis",
+                    "source_agent": "problem_solver_agent",
+                    "source_task_id": task_id,
+                    "content": result_data,
+                    "timestamp": datetime.now().isoformat(),
+                    "relevant_to": [task_id],
+                    "depth_level": task.get('depth', 0),
+                    "file_pointers": {},  # type: ignore
+                    "chain_next_agents": []  # type: ignore
+                }
+                
+                logger.info("[PROBLEM SOLVER] Analysis results saved to blackboard")
+                
+                # Update task as completed
+                updated_task: Task = {
+                    **task,
+                    "status": TaskStatus.COMPLETED,
+                    "result": result_data,
+                    "updated_at": datetime.now().isoformat()
+                }
+            else:
+                logger.warning(f"[PROBLEM SOLVER] Analysis reported failure: {error}")
+                # Create error entry on blackboard
+                analysis_entry: BlackboardEntry = {
+                    "entry_type": "problem_solver_error",
+                    "source_agent": "problem_solver_agent",
+                    "source_task_id": task_id,
+                    "content": {"error": error},
+                    "timestamp": datetime.now().isoformat(),
+                    "relevant_to": [task_id],
+                    "depth_level": task.get('depth', 0),
+                    "file_pointers": {},  # type: ignore
+                    "chain_next_agents": []  # type: ignore
+                }
+                
+                updated_task: Task = {
+                    **task,
+                    "status": TaskStatus.FAILED,
+                    "error": error,
+                    "result": result_data,
+                    "updated_at": datetime.now().isoformat()
+                }
+            
+            updated_tasks = [
+                updated_task if t['id'] == task_id else t
+                for t in state['tasks']
+            ]
+            
+            logger.info("=" * 80)
+            logger.info(f"[PROBLEM SOLVER] EXECUTION COMPLETED")
+            logger.info("=" * 80)
+            
+            return {
+                **state,
+                "tasks": updated_tasks,  # type: ignore
+                "results": {
+                    **state['results'],
+                    task_id: result_data
+                },
+                "blackboard": [analysis_entry]  # Only new entry - LangGraph will concatenate
+            }
+        
+        except Exception as e:
+            logger.error(f"[PROBLEM SOLVER] ✗ FAILED: Error executing task")
+            logger.error(f"[PROBLEM SOLVER] Exception type: {type(e).__name__}")
+            logger.error(f"[PROBLEM SOLVER] Exception message: {str(e)}")
+            logger.log_exception("Problem solver exception:", e)
             logger.info("=" * 80)
             
             updated_task = {
@@ -2905,7 +3223,7 @@ class TaskManagerAgent:
         
         except Exception as e:
             logger.error(f"[SYNTHESIS] Error during synthesis: {str(e)}")
-            logger.exception(e)
+            logger.log_exception("Synthesis exception:", e)
             
             return {
                 **state,
@@ -3169,7 +3487,7 @@ Format your response as JSON:
         
         except Exception as e:
             logger.error(f"[DEBATE] Error during agentic debate: {str(e)}")
-            logger.exception(e)
+            logger.log_exception("Debate exception:", e)
             
             return {
                 **state,
@@ -3351,7 +3669,7 @@ Respond with JSON:
         
         except Exception as e:
             logger.error(f"[AUTO-SYNTHESIS] Error during auto-synthesis: {str(e)}")
-            logger.exception(e)
+            logger.log_exception("Auto-synthesis exception:", e)
             
             # Don't fail the workflow - just log and continue
             return {
@@ -3473,7 +3791,7 @@ Respond with JSON:
                         
             except Exception as e:
                 logger.warning(f"[ERROR] ProblemSolverAgent analysis failed: {str(e)}")
-                logger.exception(e)
+                logger.log_exception("ProblemSolverAgent analysis exception:", e)
         
         # Mark task as failed in the tasks list with enhanced error info
         updated_tasks = []
@@ -3935,7 +4253,7 @@ Respond with JSON:
     # ROUTING FUNCTIONS
     # ========================================================================
     
-    def _route_with_chain_execution(self, state: AgentState) -> Literal["breakdown", "execute_task", "execute_pdf_task", "execute_excel_task", "execute_ocr_task", "execute_web_search_task", "execute_code_interpreter_task", "execute_data_extraction_task", "execute_document_task", "handle_error", "review"]:
+    def _route_with_chain_execution(self, state: AgentState) -> Literal["breakdown", "execute_task", "execute_pdf_task", "execute_excel_task", "execute_ocr_task", "execute_web_search_task", "execute_code_interpreter_task", "execute_data_extraction_task", "execute_document_task", "execute_problem_solver_task", "handle_error", "review"]:
         """
         Enhanced routing with chain execution support for cross-agent workflows.
         
@@ -4026,6 +4344,10 @@ Respond with JSON:
             "write_docx": "execute_document_task",
             "create_document": "execute_document_task",
             "write_document": "execute_document_task",
+            "problem_solving": "execute_problem_solver_task",
+            "problem_solver": "execute_problem_solver_task",
+            "analysis": "execute_problem_solver_task",
+            "analyze": "execute_problem_solver_task",
             "execute": "execute_task",
         }
         action = action_mapping.get(action, action)
@@ -4076,6 +4398,11 @@ Respond with JSON:
             logger.info(f"[ROUTE] Routing to Data Extraction task executor for {task_id}")
             self.tracer.record_routing_decision("_route_with_chain_execution", task_id, "execute_data_extraction_task", "Data extraction execution")
             return "execute_data_extraction_task"
+        elif action == "execute_problem_solver_task":
+            logger.info(f"[ROUTE] Routing to Problem Solver task executor for {task_id}")
+            logger.info(f"[ROUTE]   Task: {task.get('description', '')[:100]}")
+            self.tracer.record_routing_decision("_route_with_chain_execution", task_id, "execute_problem_solver_task", "Problem solver execution")
+            return "execute_problem_solver_task"
         elif action == "execute_document_task":
             logger.info(f"[ROUTE] Routing to Document task executor for {task_id}")
             logger.info(f"[ROUTE]   🔥 DEBUG: Routing to execute_document_task")
@@ -4090,7 +4417,7 @@ Respond with JSON:
             available_agents = [
                 'execute_pdf_task', 'execute_excel_task', 'execute_ocr_task',
                 'execute_web_search_task', 'execute_code_interpreter_task',
-                'execute_data_extraction_task', 'execute_document_task'
+                'execute_data_extraction_task', 'execute_problem_solver_task', 'execute_document_task'
             ]
             logger.error(f"[ROUTE]   Available actions: {available_agents}")
             logger.error(f"[ROUTE]   Routing to error handler for resolution")
@@ -4439,16 +4766,21 @@ Respond with JSON:
         try:
             stream_count = 0
             last_node_name = "NONE"
+            stream_iteration = 0
             for state in self.app.stream(self.initial_state, config):
+                stream_iteration += 1
                 stream_count += 1
                 # state is a dict with node name as key
                 try:
+                    logger.debug(f"[STREAM ITERATION {stream_iteration}] State keys: {list(state.keys())}")
                     node_name = list(state.keys())[0]
                     last_node_name = node_name
                     logger.info(f"🔷 GRAPH NODE EXECUTED: {node_name}")
                     print(f"🔷 GRAPH NODE EXECUTED: {node_name}", flush=True)  # Also print to stdout with flush
                     
                     result = list(state.values())[0]
+                    logger.debug(f"[STREAM] Node {node_name} result type: {type(result)}")
+                    
                     if isinstance(result, dict):
                         final_state = result  # type: ignore
                         
@@ -4458,15 +4790,21 @@ Respond with JSON:
                         completed = len(set(final_state.get('completed_task_ids', [])))
                         failed = len(set(final_state.get('failed_task_ids', [])))
                         logger.debug(f"[PROGRESS] Iter {iteration}/{self.config.max_iterations} | Tasks: {total_tasks} | Completed: {completed} | Failed: {failed}")
+                    else:
+                        logger.warning(f"[STREAM] Node {node_name} returned non-dict result: {type(result)}")
                         
                     # Check if we're approaching recursion limit
                     if stream_count % 100 == 0:
                         logger.warning(f"⚠️  Graph nodes executed: {stream_count}/{recursion_limit}")
                         
                 except Exception as e:
-                    logger.error(f"Error processing state update: {str(e)}")
-                    logger.exception(e)
+                    logger.error(f"[STREAM EXCEPTION] Iteration {stream_iteration}: Error processing state update: {str(e)}")
+                    logger.log_exception("State update exception:", e)
+                    import traceback
+                    logger.error(f"[STREAM EXCEPTION TRACEBACK]\n{traceback.format_exc()}")
                     # Continue to next state
+            
+            logger.info(f"[STREAM COMPLETED] Loop exited naturally after {stream_iteration} iterations")
             
             # If we exit the loop normally, log it
             logger.info(f"🔷 GRAPH STREAM ENDED NORMALLY after {stream_count} nodes")
@@ -4506,7 +4844,7 @@ Respond with JSON:
                 logger.error("=" * 80)
                 logger.error(f"Exception Type: {type(e).__name__}")
                 logger.error(f"Exception: {str(e)}")
-                logger.exception(e)
+                logger.log_exception("Workflow execution exception:", e)
                 logger.error("=" * 80)
                 logger.error("Workflow terminated unexpectedly. Returning last known state.")
                 logger.error("=" * 80)
@@ -5224,23 +5562,73 @@ Respond with JSON:
     @staticmethod
     def _parse_json_response(content: str) -> dict:
         """
-        Parse JSON response from LLM, handling markdown formatting.
+        Parse JSON response from LLM, handling markdown formatting and errors.
+        
+        Robust parser that:
+        - Extracts JSON from markdown code blocks
+        - Handles incomplete JSON with fallback
+        - Validates required fields
+        - Provides helpful error messages
         
         Args:
             content: Raw response content from LLM
             
         Returns:
-            Parsed JSON dictionary
+            Parsed JSON dictionary with valid structure
+            
+        Raises:
+            ValueError: If JSON cannot be parsed or lacks required fields
         """
+        if not content or not isinstance(content, str):
+            raise ValueError(f"Invalid content type: {type(content)}, expected string")
+        
         content = content.strip()
         
-        # Remove markdown if present
+        # Remove markdown code blocks
         if content.startswith("```json"):
-            content = content.split("```json")[1].split("```")[0].strip()
+            parts = content.split("```json")
+            if len(parts) > 1:
+                content = parts[1].split("```")[0].strip()
         elif content.startswith("```"):
-            content = content.split("```")[1].split("```")[0].strip()
+            parts = content.split("```")
+            if len(parts) > 2:
+                content = parts[1].strip()
         
-        return json.loads(content)
+        if not content:
+            raise ValueError("Content is empty after removing markdown")
+        
+        try:
+            parsed = json.loads(content)
+            
+            # Validate that result is a dict
+            if not isinstance(parsed, dict):
+                raise ValueError(f"Parsed result is not a dict: {type(parsed)}")
+            
+            return parsed
+            
+        except json.JSONDecodeError as e:
+            # Try to provide helpful error message
+            error_msg = f"Failed to parse JSON: {str(e)}"
+            logger.error(f"[PARSE] {error_msg}")
+            logger.error(f"[PARSE] Content preview: {content[:200]}...")
+            
+            # Try to recover by finding first { and last }
+            first_brace = content.find('{')
+            last_brace = content.rfind('}')
+            
+            if first_brace >= 0 and last_brace > first_brace:
+                logger.warning("[PARSE] Attempting to recover by extracting JSON object...")
+                recovered_content = content[first_brace:last_brace + 1]
+                try:
+                    parsed = json.loads(recovered_content)
+                    logger.info("[PARSE] ✓ Successfully recovered JSON from response")
+                    return parsed
+                except json.JSONDecodeError as e2:
+                    logger.error(f"[PARSE] Recovery failed: {str(e2)}")
+                    raise ValueError(f"Could not parse JSON even after recovery attempt: {str(e2)}")
+            else:
+                raise ValueError(f"Could not find JSON object boundaries in response: {str(e)}")
+
     def _detect_chain_execution(self, agent_output: dict) -> List[str]:
         """
         Detect if agent output should trigger chain execution to next agent.

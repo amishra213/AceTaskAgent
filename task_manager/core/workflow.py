@@ -67,6 +67,7 @@ class WorkflowBuilder:
         workflow.add_node("execute_web_search_task", self.agent._execute_web_search_task)
         workflow.add_node("execute_code_interpreter_task", self.agent._execute_code_interpreter_task)
         workflow.add_node("execute_data_extraction_task", self.agent._execute_data_extraction_task)
+        workflow.add_node("execute_problem_solver_task", self.agent._execute_problem_solver_task)
         workflow.add_node("execute_document_task", self.agent._execute_document_task)
         workflow.add_node("aggregate_results", self.agent._aggregate_results)
         workflow.add_node("synthesize_research", self.agent._synthesize_research)
@@ -82,12 +83,14 @@ class WorkflowBuilder:
         workflow.add_edge("initialize", "select_task")
         
         # Conditional routing after select_task
-        # If no pending tasks, end the workflow; otherwise continue to analyze
+        # If no pending tasks, end the workflow; otherwise continue to analyze or handle errors
         workflow.add_conditional_edges(
             "select_task",
             self._route_after_select_task,
             {
                 "analyze_task": "analyze_task",
+                "handle_error": "handle_error",
+                "human_review": "human_review",
                 "complete": END
             }
         )
@@ -106,6 +109,7 @@ class WorkflowBuilder:
                 "execute_web_search_task": "execute_web_search_task",
                 "execute_code_interpreter_task": "execute_code_interpreter_task",
                 "execute_data_extraction_task": "execute_data_extraction_task",
+                "execute_problem_solver_task": "execute_problem_solver_task",
                 "execute_document_task": "execute_document_task",
                 "handle_error": "handle_error",
                 "review": "human_review"
@@ -169,6 +173,9 @@ class WorkflowBuilder:
         
         # Data extraction always goes to aggregate (context building stage)
         workflow.add_edge("execute_data_extraction_task", "aggregate_results")
+        
+        # Problem solver always goes to aggregate (analysis stage)
+        workflow.add_edge("execute_problem_solver_task", "aggregate_results")
         
         # Document creation always goes to aggregate (final processing stage)
         workflow.add_edge("execute_document_task", "aggregate_results")
@@ -255,20 +262,29 @@ class WorkflowBuilder:
         
         return workflow
     
-    def _route_after_select_task(self, state: "AgentState") -> Literal["analyze_task", "complete"]:
+    def _route_after_select_task(self, state: "AgentState") -> Literal["analyze_task", "handle_error", "human_review", "complete"]:
         """
-        Determine if workflow should continue to analyze_task or end.
+        Determine if workflow should continue to analyze_task, handle errors, request human review, or end.
         
-        Routes to END when:
-        1. No pending tasks remaining (all completed or failed)
-        2. No active_task_id was set (nothing left to process)
+        Priority routing:
+        1. If requires_human_review flag is set → human_review (for failed tasks)
+        2. If active_task_id is set → analyze_task (normal flow)
+        3. If no pending tasks → complete (workflow end)
         
         Args:
             state: Current agent state
             
         Returns:
-            "analyze_task" to continue processing, "complete" to end workflow
+            Route to next node: "analyze_task", "human_review", "complete", or "handle_error"
         """
+        # Check if human review is required (from failed analysis)
+        if state.get('requires_human_review', False):
+            active_task_id = state.get('active_task_id', '')
+            if active_task_id:
+                logger.warning(f"[ROUTE AFTER SELECT] Human review required for task {active_task_id}")
+                logger.warning("[ROUTE AFTER SELECT] Routing to human_review for failed task recovery")
+                return "human_review"
+        
         active_task_id = state.get('active_task_id', '')
         
         # If select_task found no pending tasks, it returns empty active_task_id

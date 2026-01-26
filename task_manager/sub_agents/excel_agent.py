@@ -473,7 +473,7 @@ class ExcelAgent:
             logger.error(f"[CREATE] EXCEPTION during Excel creation!")
             logger.error(f"[CREATE] Exception type: {type(e).__name__}")
             logger.error(f"[CREATE] Exception message: {str(e)}")
-            logger.exception(e)
+            logger.log_exception("Excel creation exception:", e)
             logger.error(f"[CREATE] Output path attempted: {output_path}")
             logger.error("=" * 80)
             return {

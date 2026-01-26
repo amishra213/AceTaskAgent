@@ -494,7 +494,7 @@ def trace_node_execution(node_name: str, tracer: Optional['ExecutionTracer'] = N
                     )
                 
                 logger.error(f"[TRACE] Error in {node_name}: {str(e)}")
-                logger.exception(e)
+                logger.log_exception("Trace error:", e)
                 raise
         
         return wrapper

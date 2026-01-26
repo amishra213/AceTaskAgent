@@ -538,7 +538,7 @@ class EventBus:
         
         except Exception as e:
             logger.error(f"[EVENT_BUS] Error handling task execution request: {str(e)}")
-            logger.exception(e)
+            logger.log_exception("Event bus exception:", e)
             
             # Publish error event
             error_event = create_system_event(

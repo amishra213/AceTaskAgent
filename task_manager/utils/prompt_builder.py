@@ -54,10 +54,11 @@ class PromptBuilder:
             depth_guidance = f"""
 IMPORTANT DEPTH CONSTRAINT:
 - Current depth: {current_depth} (approaching limit of {depth_limit})
-- At depth 2+, STRONGLY PREFER "execute" or specific agent actions (web_search_task, etc.)
+- At depth 2+, STRONGLY PREFER specific agent actions (execute_web_search_task, execute_problem_solver_task, etc.)
 - Only use "breakdown" if absolutely necessary for complex multi-step operations
-- For research/search tasks, use "web_search_task" directly
-- For data analysis, use "code_interpreter_task" directly
+- For research/search tasks, use "execute_web_search_task" directly
+- For data analysis, use "execute_code_interpreter_task" directly
+- For analysis/synthesis, use "execute_problem_solver_task" directly
 """
         
         # Build input context section if available (from DataExtractionAgent)
@@ -96,10 +97,10 @@ Extracted Data ({len(extractions)} files, {input_context.get('total_content_size
                 
                 input_context_section += """
 IMPORTANT: Use data from these input files when relevant to the task.
-- Use "pdf_task" for deeper PDF analysis
-- Use "excel_task" for Excel operations  
-- Use "ocr_task" for image text extraction
-- Use "data_extraction_task" for more detailed extraction from specific files
+- Use "execute_pdf_task" for deeper PDF analysis
+- Use "execute_excel_task" for Excel operations  
+- Use "execute_ocr_task" for image text extraction
+- Use "execute_data_extraction_task" for more detailed extraction from specific files
 """
         
         prompt = f"""
@@ -118,7 +119,7 @@ METADATA: {json.dumps(metadata, indent=2)}
 
 Analyze this task and respond with ONLY a JSON object:
 {{
-  "action": "breakdown" or "execute" or "skip" or "pdf_task" or "excel_task" or "ocr_task" or "web_search_task" or "code_interpreter_task" or "data_extraction_task",
+  "action": "breakdown" or "execute_task" or "execute_pdf_task" or "execute_excel_task" or "execute_ocr_task" or "execute_web_search_task" or "execute_code_interpreter_task" or "execute_data_extraction_task" or "execute_problem_solver_task" or "execute_document_task",
   "reasoning": "brief explanation",
   "subtasks": ["subtask1", "subtask2", ...] or null,
   "search_query": "query for web search" or null,
@@ -129,16 +130,17 @@ Analyze this task and respond with ONLY a JSON object:
 
 Guidelines:
 - Use "breakdown" if task is complex and needs splitting into 2-5 subtasks
-- Use "execute" if task is specific enough to be completed now (e.g., search for data)
-- Use "skip" if task is already implicit in other tasks or not needed
-- Use "pdf_task" if task involves PDF file operations (read, create, merge, extract)
-- Use "excel_task" if task involves Excel file operations (read, create, write, format)
-- Use "ocr_task" if task involves OCR or image extraction (extract text from images, extract images from PDFs/docs)
-- Use "web_search_task" if task involves web search or content retrieval (search, scrape, fetch, summarize)
-- Use "code_interpreter_task" if task involves data analysis, code generation, or computational tasks (analyze data, generate code, create visualizations)
-- Use "data_extraction_task" if task requires extracting specific data from input files or searching within input folder contents
-- Provide search_query only if action is "execute" and requires web search
-- Provide file_operation only if action is "pdf_task", "excel_task", "ocr_task", "web_search_task", "code_interpreter_task", or "data_extraction_task"
+- Use "execute_task" if task is generic and can be completed as-is
+- Use "execute_pdf_task" if task involves PDF file operations (read, create, merge, extract)
+- Use "execute_excel_task" if task involves Excel file operations (read, create, write, format)
+- Use "execute_ocr_task" if task involves OCR or image extraction (extract text from images, extract images from PDFs/docs)
+- Use "execute_web_search_task" if task involves web search or content retrieval (search, scrape, fetch, summarize)
+- Use "execute_code_interpreter_task" if task involves data analysis, code generation, or computational tasks (analyze data, generate code, create visualizations)
+- Use "execute_data_extraction_task" if task requires extracting specific data from input files or searching within input folder contents
+- Use "execute_problem_solver_task" if task requires analysis, synthesis, comparison, or problem-solving using blackboard data (analyze trends, comprehensive analysis, synthesis, comparison)
+- Use "execute_document_task" if task requires document generation or formatting
+- Provide search_query only if action is "execute_web_search_task" and requires a specific search
+- Provide file_operation only if action is "execute_pdf_task", "execute_excel_task", "execute_ocr_task", "execute_web_search_task", "execute_code_interpreter_task", or "execute_data_extraction_task"
   - For PDF: operations are "read", "create", "merge", "extract_pages"
   - For Excel: operations are "read", "create", "write", "format"
   - For OCR: operations are "ocr_image", "extract_images_from_pdf", "batch_ocr", "process_screenshot"
