@@ -67,6 +67,7 @@ class WorkflowBuilder:
         workflow.add_node("execute_web_search_task", self.agent._execute_web_search_task)
         workflow.add_node("execute_code_interpreter_task", self.agent._execute_code_interpreter_task)
         workflow.add_node("execute_data_extraction_task", self.agent._execute_data_extraction_task)
+        workflow.add_node("execute_document_task", self.agent._execute_document_task)
         workflow.add_node("aggregate_results", self.agent._aggregate_results)
         workflow.add_node("synthesize_research", self.agent._synthesize_research)
         workflow.add_node("agentic_debate", self.agent._agentic_debate)  # NEW: debate node for consensus validation
@@ -105,6 +106,7 @@ class WorkflowBuilder:
                 "execute_web_search_task": "execute_web_search_task",
                 "execute_code_interpreter_task": "execute_code_interpreter_task",
                 "execute_data_extraction_task": "execute_data_extraction_task",
+                "execute_document_task": "execute_document_task",
                 "handle_error": "handle_error",
                 "review": "human_review"
             }
@@ -167,6 +169,9 @@ class WorkflowBuilder:
         
         # Data extraction always goes to aggregate (context building stage)
         workflow.add_edge("execute_data_extraction_task", "aggregate_results")
+        
+        # Document creation always goes to aggregate (final processing stage)
+        workflow.add_edge("execute_document_task", "aggregate_results")
         
         # Auto-synthesis always goes to aggregate (observer pattern completes)
         workflow.add_edge("auto_synthesis", "aggregate_results")

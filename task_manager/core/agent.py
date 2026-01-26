@@ -26,7 +26,7 @@ from task_manager.utils.exceptions import (
 )
 from task_manager.sub_agents import (
     PDFAgent, ExcelAgent, OCRImageAgent, WebSearchAgent, 
-    CodeInterpreterAgent, DataExtractionAgent, ProblemSolverAgent
+    CodeInterpreterAgent, DataExtractionAgent, ProblemSolverAgent, DocumentAgent
 )
 from .workflow import WorkflowBuilder
 from .master_planner import MasterPlanner, PlanStatus, BlackboardType
@@ -120,6 +120,7 @@ class TaskManagerAgent:
         self.ocr_image_agent = OCRImageAgent(llm=self.llm)
         self.web_search_agent = WebSearchAgent()
         self.code_interpreter_agent = CodeInterpreterAgent(llm=self.llm)
+        self.document_agent = DocumentAgent()
         # Note: data_extraction_agent already initialized above for context building
         
         # Initialize ProblemSolverAgent for LLM-based error analysis and human input interpretation
@@ -144,7 +145,7 @@ class TaskManagerAgent:
         self.app = self.workflow.compile(checkpointer=self.memory)
         
         logger.debug(f"Agent initialized with max_iterations={self.config.max_iterations}")
-        logger.debug("Sub-agents initialized: PDFAgent, ExcelAgent, OCRImageAgent, WebSearchAgent, CodeInterpreterAgent, ProblemSolverAgent")
+        logger.debug("Sub-agents initialized: PDFAgent, ExcelAgent, OCRImageAgent, WebSearchAgent, CodeInterpreterAgent, DataExtractionAgent, DocumentAgent, ProblemSolverAgent")
     
     
     def _initialize_llm(self):
@@ -2409,6 +2410,185 @@ class TaskManagerAgent:
             }
     
     
+    def _execute_document_task(self, state: AgentState) -> AgentState:
+        """
+        Execute a document file operation task using DocumentAgent.
+        
+        Capabilities:
+        - Create and format DOCX files with rich formatting
+        - Create TXT files with structured content
+        - Handle content with headings, lists, paragraphs
+        - Automatic file naming with timestamps
+        - File path management with output folder defaults
+        """
+        task_id = state['active_task_id']
+        task = next(t for t in state['tasks'] if t['id'] == task_id)
+        analysis = task.get('result') if isinstance(task, dict) else task['result']
+        
+        # Ensure analysis is a dict
+        if not isinstance(analysis, dict):
+            analysis = {}
+        
+        logger.info("=" * 80)
+        logger.info(f"[DOCUMENT AGENT] EXECUTION STARTED")
+        logger.info("=" * 80)
+        logger.info(f"Task ID: {task_id}")
+        logger.info(f"Description: {task['description'][:100]}...")
+        logger.info(f"Depth Level: {task.get('depth', 0)}")
+        
+        try:
+            # Extract file operation details from analysis
+            file_operation = analysis.get('file_operation', {})
+            if not file_operation or file_operation.get('type') not in ['docx', 'txt']:
+                logger.error(f"[DOCUMENT AGENT] ✗ Invalid document operation specification")
+                logger.error(f"[DOCUMENT AGENT]   Received: {file_operation}")
+                
+                updated_task = {
+                    **task,
+                    "status": TaskStatus.FAILED,
+                    "error": "Invalid document operation specification - type must be 'docx' or 'txt'",
+                    "updated_at": datetime.now().isoformat()
+                }
+                
+                updated_tasks = [
+                    updated_task if t['id'] == task_id else t
+                    for t in state['tasks']
+                ]
+                
+                return {
+                    **state,
+                    "tasks": updated_tasks,  # type: ignore
+                    "failed_task_ids": [task_id]
+                }
+            
+            operation = file_operation.get('operation', 'create')
+            parameters = file_operation.get('parameters', {})
+            
+            # Generate default filename if not provided
+            if operation == 'create' and not parameters.get('file_path'):
+                safe_task_id = task_id.replace('.', '_')
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                doc_type = file_operation.get('type', 'docx')
+                default_filename = f"document_{safe_task_id}_{timestamp}.{doc_type}"
+                parameters['file_path'] = str(self.config.folders.output_path / default_filename)
+                logger.info(f"[DOCUMENT AGENT] Generated default filename: {default_filename}")
+            
+            logger.info(f"[DOCUMENT AGENT] Operation: {operation}")
+            logger.info(f"[DOCUMENT AGENT] Type: {file_operation.get('type')}")
+            logger.info(f"[DOCUMENT AGENT] File: {parameters.get('file_path', 'N/A')[:80]}...")
+            logger.info(f"[DOCUMENT AGENT] Parameters: {parameters}")
+            logger.info("-" * 80)
+            
+            # Create standardized AgentExecutionRequest
+            logger.info(f"[DOCUMENT AGENT] Calling DocumentAgent.execute_task() with standardized request...")
+            request: AgentExecutionRequest = {
+                "task_id": task_id,
+                "task_description": task['description'],
+                "task_type": "atomic",
+                "operation": operation,
+                "parameters": parameters,
+                "input_data": file_operation,
+                "temp_folder": str(self.config.folders.temp_path),
+                "output_folder": str(self.config.folders.output_path),
+                "cache_enabled": True,
+                "blackboard": cast(list[dict[str, Any]], state.get('blackboard', [])),
+                "relevant_entries": [],
+                "max_retries": 3
+            }
+            
+            # Execute using standardized interface
+            response = cast(AgentExecutionResponse, self.document_agent.execute_task(request=request))
+            
+            # Extract legacy-compatible result_data from standardized response
+            result_data = {
+                'success': response['success'],
+                'file_path': response['result'].get('file_path', ''),
+                'file_size': response['result'].get('file_size', 0),
+                'document_type': response['result'].get('document_type', ''),
+                'summary': response['result'].get('summary', ''),
+                **response['result']
+            }
+            
+            # Update task with results
+            updated_task = {
+                **task,
+                "status": TaskStatus.COMPLETED if response['success'] else TaskStatus.FAILED,
+                "result": result_data,
+                "updated_at": datetime.now().isoformat()
+            }
+            
+            updated_tasks = [
+                updated_task if t['id'] == task_id else t
+                for t in state['tasks']
+            ]
+            
+            logger.info("-" * 80)
+            logger.info(f"[DOCUMENT AGENT] ✓ SUCCESS: Task {task_id} completed")
+            logger.info(f"[DOCUMENT AGENT] Status: {updated_task['status']}")
+            logger.info(f"[DOCUMENT AGENT] File: {result_data.get('file_path', 'N/A')}")
+            logger.info(f"[DOCUMENT AGENT] Size: {result_data.get('file_size', 0)} bytes")
+            logger.info("=" * 80)
+            
+            # Create blackboard entry with document metadata
+            blackboard_entry: BlackboardEntry = {
+                "entry_type": "document_creation_result",
+                "source_agent": "document_agent",
+                "source_task_id": task_id,
+                "content": {
+                    "operation": operation,
+                    "success": result_data.get('success'),
+                    "file_path": result_data.get('file_path', ''),
+                    "file_size": result_data.get('file_size', 0),
+                    "document_type": result_data.get('document_type', ''),
+                    "execution_time_ms": response.get('execution_time_ms', 0)
+                },
+                "timestamp": datetime.now().isoformat(),
+                "relevant_to": [task_id],
+                "depth_level": 0,
+                "file_pointers": {}
+            }
+            
+            # Add source file path for traceability
+            output_file = parameters.get('file_path', '')
+            if output_file:
+                blackboard_entry["source_file_path"] = output_file  # type: ignore
+            
+            return {
+                **state,
+                "tasks": updated_tasks,  # type: ignore
+                "results": {
+                    **state['results'],
+                    task_id: result_data
+                },
+                "blackboard": [blackboard_entry]  # Only new entry - LangGraph will concatenate
+            }
+        
+        except Exception as e:
+            logger.error(f"[DOCUMENT AGENT] ✗ FAILED: Error executing task")
+            logger.error(f"[DOCUMENT AGENT] Exception type: {type(e).__name__}")
+            logger.error(f"[DOCUMENT AGENT] Exception message: {str(e)}")
+            logger.exception(e)
+            logger.info("=" * 80)
+            
+            updated_task = {
+                **task,
+                "status": TaskStatus.FAILED,
+                "error": str(e),
+                "updated_at": datetime.now().isoformat()
+            }
+            
+            updated_tasks = [
+                updated_task if t['id'] == task_id else t
+                for t in state['tasks']
+            ]
+            
+            return {
+                **state,
+                "tasks": updated_tasks,  # type: ignore
+                "failed_task_ids": [task_id]
+            }
+    
+    
     def _aggregate_results(self, state: AgentState) -> AgentState:
         """Aggregate results from completed task."""
         task_id = state['active_task_id']
@@ -3653,7 +3833,7 @@ Respond with JSON:
     # ROUTING FUNCTIONS
     # ========================================================================
     
-    def _route_with_chain_execution(self, state: AgentState) -> Literal["breakdown", "execute_task", "execute_pdf_task", "execute_excel_task", "execute_ocr_task", "execute_web_search_task", "execute_code_interpreter_task", "execute_data_extraction_task", "handle_error", "review"]:
+    def _route_with_chain_execution(self, state: AgentState) -> Literal["breakdown", "execute_task", "execute_pdf_task", "execute_excel_task", "execute_ocr_task", "execute_web_search_task", "execute_code_interpreter_task", "execute_data_extraction_task", "execute_document_task", "handle_error", "review"]:
         """
         Enhanced routing with chain execution support for cross-agent workflows.
         
@@ -3725,6 +3905,13 @@ Respond with JSON:
             "data_extraction_task": "execute_data_extraction_task",
             "data_extraction": "execute_data_extraction_task",
             "extract_data": "execute_data_extraction_task",
+            "document_task": "execute_document_task",
+            "document": "execute_document_task",
+            "docx": "execute_document_task",
+            "create_docx": "execute_document_task",
+            "write_docx": "execute_document_task",
+            "create_document": "execute_document_task",
+            "write_document": "execute_document_task",
             "execute": "execute_task",
         }
         action = action_mapping.get(action, action)
@@ -3766,9 +3953,20 @@ Respond with JSON:
         elif action == "execute_data_extraction_task":
             logger.info(f"[ROUTE] Routing to Data Extraction task executor for {task_id}")
             return "execute_data_extraction_task"
+        elif action == "execute_document_task":
+            logger.info(f"[ROUTE] Routing to Document task executor for {task_id}")
+            return "execute_document_task"
         else:
-            logger.error(f"[ROUTE] Unknown action '{action}' for task {task_id}")
-            logger.warning(f"[ROUTE] 🔥 DEBUG: Action not recognized, returning 'handle_error'")
+            logger.error(f"[ROUTE] ✗ UNKNOWN ACTION: Task {task_id}")
+            logger.error(f"[ROUTE]   Action requested: '{action}'")
+            logger.error(f"[ROUTE]   Analysis: {analysis}")
+            available_agents = [
+                'execute_pdf_task', 'execute_excel_task', 'execute_ocr_task',
+                'execute_web_search_task', 'execute_code_interpreter_task',
+                'execute_data_extraction_task', 'execute_document_task'
+            ]
+            logger.error(f"[ROUTE]   Available actions: {available_agents}")
+            logger.error(f"[ROUTE]   Routing to error handler for resolution")
             return "handle_error"
     
     
