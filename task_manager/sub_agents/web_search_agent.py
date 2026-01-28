@@ -55,6 +55,7 @@ class WebSearchAgent:
         self.agent_name = "web_search_agent"
         self.supported_operations = [
             "search",
+            "paginated_search",  # ✨ NEW: Pagination support
             "scrape",
             "fetch",
             "summarize",
@@ -374,6 +375,233 @@ class WebSearchAgent:
                 "success": False,
                 "error": str(e),
                 "query": query
+            }
+    
+    def paginated_search(
+        self,
+        query: str,
+        max_results: int = 50,
+        language: str = "en",
+        backend: Optional[str] = None,
+        batch_size: int = 5,
+        max_batches: int = 10,
+        retry_on_empty: bool = True
+    ) -> Dict[str, Any]:
+        """
+        ENHANCED: Perform a paginated web search with iterative calls.
+        
+        When requesting more than the default batch_size results, this method
+        makes multiple search calls, each time continuing from where the previous
+        call ended (similar to pagination logic).
+        
+        Args:
+            query: Search query string
+            max_results: Total maximum number of results to retrieve (default 50)
+            language: Language/region code for search results
+            backend: Search engine backend to use
+            batch_size: Number of results per search call (default 5)
+            max_batches: Maximum number of batches/calls to make (default 10)
+            retry_on_empty: Whether to retry with reformulated query
+        
+        Returns:
+            Dictionary with aggregated paginated search results
+        """
+        logger.info(f"🔍 Starting PAGINATED search: query='{query}'")
+        logger.info(f"📊 Pagination config: max_results={max_results}, batch_size={batch_size}, max_batches={max_batches}")
+        
+        try:
+            if not self.search_lib:
+                logger.error("❌ No search library installed")
+                return {
+                    "success": False,
+                    "error": "No search library installed",
+                    "query": query
+                }
+            
+            # Calculate number of batches needed
+            total_batches = min(
+                (max_results + batch_size - 1) // batch_size,  # Ceiling division
+                max_batches
+            )
+            
+            logger.info(f"📋 Will perform {total_batches} search batches (each requesting {batch_size} results)")
+            
+            all_results = []
+            all_attempts = []
+            batch_attempts = []
+            failed_batches = []
+            
+            search_backend = backend or self.default_backend
+            search_region = language or self.default_region
+            
+            # Pagination loop - each iteration gets the next batch
+            for batch_num in range(1, total_batches + 1):
+                logger.info(f"\n{'='*80}")
+                logger.info(f"📄 BATCH {batch_num}/{total_batches}")
+                logger.info(f"{'='*80}")
+                
+                batch_start_time = datetime.now()
+                
+                try:
+                    # Perform individual search for this batch
+                    logger.info(f"  → Requesting {batch_size} results (offset: {(batch_num-1)*batch_size})")
+                    
+                    batch_result = self.search(
+                        query=query,
+                        max_results=batch_size,
+                        language=language,
+                        backend=search_backend,
+                        retry_on_empty=retry_on_empty and batch_num == 1,  # Only retry on first batch
+                        max_retries=2
+                    )
+                    
+                    batch_time = (datetime.now() - batch_start_time).total_seconds()
+                    
+                    if batch_result.get("success"):
+                        batch_results = batch_result.get("results", [])
+                        batch_count = len(batch_results)
+                        
+                        logger.info(f"  ✅ Batch {batch_num}: Retrieved {batch_count} results (in {batch_time:.2f}s)")
+                        
+                        # Log each result in batch
+                        for idx, result in enumerate(batch_results, 1):
+                            rank = len(all_results) + idx  # Global rank across all batches
+                            url = result.get('url', 'N/A')
+                            title = result.get('title', 'N/A')[:60]
+                            snippet = result.get('snippet', 'N/A')[:80]
+                            
+                            logger.debug(f"    [{rank}] {title}")
+                            logger.debug(f"        URL: {url}")
+                            logger.debug(f"        Snippet: {snippet}...")
+                            
+                            # Add global rank to result
+                            result['global_rank'] = rank
+                        
+                        all_results.extend(batch_results)
+                        
+                        batch_attempts.append({
+                            "batch_num": batch_num,
+                            "query": query,
+                            "results_count": batch_count,
+                            "time_seconds": batch_time,
+                            "status": "success"
+                        })
+                        
+                        logger.info(f"  📊 Running total: {len(all_results)} results collected so far")
+                        
+                        # Stop if we got fewer results than requested (end of results)
+                        if batch_count < batch_size:
+                            logger.info(f"  ⏹️  End of results reached (got {batch_count} results, expected {batch_size})")
+                            logger.info(f"     Stopping pagination - no more results available")
+                            break
+                        
+                        # Stop if we've reached max_results
+                        if len(all_results) >= max_results:
+                            logger.info(f"  ✓ Reached target of {max_results} results")
+                            all_results = all_results[:max_results]  # Trim to exact max
+                            break
+                    
+                    else:
+                        error_msg = batch_result.get("error", "Unknown error")
+                        logger.warning(f"  ⚠️  Batch {batch_num}: Failed - {error_msg}")
+                        
+                        batch_attempts.append({
+                            "batch_num": batch_num,
+                            "query": query,
+                            "results_count": 0,
+                            "time_seconds": batch_time,
+                            "status": "failed",
+                            "error": error_msg
+                        })
+                        
+                        failed_batches.append(batch_num)
+                        
+                        # If first batch fails, return error
+                        if batch_num == 1:
+                            logger.error(f"  ❌ First batch failed - aborting pagination")
+                            return batch_result
+                        else:
+                            # Continue with other batches if not first
+                            logger.info(f"  ⏭️  Skipping failed batch, continuing to next...")
+                            continue
+                
+                except Exception as batch_error:
+                    logger.error(f"  ❌ Batch {batch_num} exception: {str(batch_error)}")
+                    batch_time = (datetime.now() - batch_start_time).total_seconds()
+                    
+                    batch_attempts.append({
+                        "batch_num": batch_num,
+                        "query": query,
+                        "results_count": 0,
+                        "time_seconds": batch_time,
+                        "status": "exception",
+                        "error": str(batch_error)
+                    })
+                    
+                    failed_batches.append(batch_num)
+                    
+                    if batch_num == 1:
+                        return {
+                            "success": False,
+                            "error": f"First batch failed: {str(batch_error)}",
+                            "query": query
+                        }
+                    continue
+            
+            # Log final summary
+            logger.info(f"\n{'='*80}")
+            logger.info(f"📊 PAGINATION SUMMARY")
+            logger.info(f"{'='*80}")
+            logger.info(f"  ✓ Total results collected: {len(all_results)}")
+            logger.info(f"  ✓ Successful batches: {total_batches - len(failed_batches)}/{total_batches}")
+            if failed_batches:
+                logger.info(f"  ⚠️  Failed batches: {failed_batches}")
+            logger.info(f"  ✓ Final query: {query}")
+            logger.info(f"{'='*80}\n")
+            
+            # Log each result at the end for quick reference
+            logger.info(f"📋 ALL {len(all_results)} RESULTS (FINAL LIST):")
+            logger.info(f"{'='*80}")
+            for idx, result in enumerate(all_results, 1):
+                url = result.get('url', 'N/A')
+                title = result.get('title', 'N/A')
+                snippet = result.get('snippet', 'N/A')[:100]
+                source = result.get('source', 'Unknown')
+                
+                logger.info(f"{idx}. {title}")
+                logger.info(f"   URL: {url}")
+                logger.info(f"   Source: {source}")
+                logger.info(f"   Snippet: {snippet}...")
+            
+            logger.info(f"{'='*80}\n")
+            
+            return {
+                "success": True,
+                "query": query,
+                "results_count": len(all_results),
+                "results": all_results,
+                "pagination_stats": {
+                    "total_batches": total_batches,
+                    "successful_batches": total_batches - len(failed_batches),
+                    "failed_batches": failed_batches,
+                    "batch_size": batch_size,
+                    "results_per_batch": [b.get("results_count", 0) for b in batch_attempts]
+                },
+                "batch_details": batch_attempts,
+                "search_time": datetime.now().isoformat()
+            }
+        
+        except Exception as e:
+            logger.error(f"❌ Error in paginated search: {str(e)}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            
+            return {
+                "success": False,
+                "error": f"Paginated search failed: {str(e)}",
+                "query": query,
+                "partial_results": all_results if 'all_results' in locals() else [],
+                "batch_details": batch_attempts if 'batch_attempts' in locals() else []
             }
     
     def scrape(
@@ -1141,7 +1369,7 @@ class WebSearchAgent:
         query: str,
         target_url: Optional[str] = None,
         max_results: int = 5,
-        max_depth: int = 2,
+        max_depth: int = 4,
         relevance_keywords: Optional[List[str]] = None,
         extract_structured_data: bool = True
     ) -> Dict[str, Any]:
@@ -1149,25 +1377,30 @@ class WebSearchAgent:
         Perform a deep search like a human would - traverse search results,
         visit each page, extract relevant information, and follow internal links.
         
+        ENHANCED: Now goes 3-4 links deep into pages from the leading 5 results.
+        
         This method mimics human browsing behavior:
         1. If target_url provided, starts there; otherwise searches with query
-        2. Visits each result page and extracts content
-        3. Evaluates content relevance based on keywords
-        4. Follows promising internal links (up to max_depth)
-        5. Aggregates all findings into a comprehensive result
+        2. Limits to TOP 5 SEARCH RESULTS for focused research
+        3. Visits each result page and extracts content thoroughly
+        4. Evaluates content relevance based on keywords
+        5. Follows promising internal links up to 3-4 levels deep
+        6. Aggregates all findings into a comprehensive result with deduplication
         
         Args:
             query: Search query or topic to research
             target_url: Optional specific URL to start from (skip search)
-            max_results: Maximum search results to visit (default 5)
-            max_depth: How deep to follow internal links (default 2)
+            max_results: Maximum search results to visit - LIMITED TO 5 FOR DEPTH FOCUS (default 5)
+            max_depth: How deep to follow internal links - ENHANCED to 3-4 levels (default 4)
             relevance_keywords: Keywords to filter relevant content
             extract_structured_data: Whether to try extracting lists/tables
         
         Returns:
-            Dictionary with aggregated research findings
+            Dictionary with aggregated research findings including items from 3-4 links deep
         """
-        logger.info(f"Starting deep search for: {query}")
+        logger.info(f"Starting ENHANCED deep search for: {query}")
+        logger.info(f"🔍 ENHANCEMENT: Will traverse {max_depth} levels deep into top {max_results} results")
+        logger.info(f"🔍 ENHANCEMENT: Focus is on extracting detailed information from promising links")
         
         # Extract keywords from query if not provided
         if not relevance_keywords:
@@ -1197,7 +1430,7 @@ class WebSearchAgent:
             return matches / len(relevance_keywords) if relevance_keywords else 0.0
         
         def extract_structured_content(html: str, text: str) -> Dict[str, Any]:
-            """Try to extract structured data like lists, tables, etc."""
+            """ENHANCED: Extract structured data like lists, tables, definitions with better filtering."""
             from bs4 import BeautifulSoup
             
             soup = BeautifulSoup(html, 'html.parser')
@@ -1205,64 +1438,140 @@ class WebSearchAgent:
                 "lists": [],
                 "tables": [],
                 "headings": [],
-                "key_paragraphs": []
+                "key_paragraphs": [],
+                "definitions": [],  # NEW: For definition lists and data
+                "code_blocks": []   # NEW: For code examples
             }
             
-            # Extract headings
-            for tag in ['h1', 'h2', 'h3']:
+            # Extract headings with hierarchy preserved
+            for tag in ['h1', 'h2', 'h3', 'h4']:
                 for heading in soup.find_all(tag):
                     heading_text = heading.get_text(strip=True)
                     if heading_text and len(heading_text) > 3:
-                        structured["headings"].append(heading_text)
+                        level = int(tag[1])
+                        structured["headings"].append({
+                            "text": heading_text,
+                            "level": level,
+                            "type": tag
+                        })
             
-            # Extract lists
+            # Extract lists with better handling
             for ul in soup.find_all(['ul', 'ol']):
                 items = []
                 for li in ul.find_all('li', recursive=False):
-                    item_text = li.get_text(strip=True)
-                    if item_text and len(item_text) > 2:
-                        items.append(item_text)
+                    # Get text and any nested structure
+                    li_text = li.get_text(strip=True)
+                    if li_text and len(li_text) > 2:
+                        items.append(li_text)
+                
+                # Also check for nested lists
+                for nested_li in ul.find_all('li'):
+                    nested_text = nested_li.get_text(strip=True)
+                    if nested_text and len(nested_text) > 2 and nested_text not in items:
+                        items.append(nested_text)
+                
                 if items:
-                    structured["lists"].append(items)
+                    structured["lists"].append(items[:50])  # Limit per list
             
-            # Extract tables
+            # Extract tables with row context
             for table in soup.find_all('table'):
                 rows = []
-                for tr in table.find_all('tr'):
+                headers = []
+                
+                # Get header row if exists
+                thead = table.find('thead')
+                if thead:
+                    for th in thead.find_all('th'):
+                        headers.append(th.get_text(strip=True))
+                
+                # Get data rows
+                tbody = table.find('tbody')
+                rows_source = tbody.find_all('tr') if tbody else table.find_all('tr')
+                
+                for tr in rows_source[:50]:  # Limit rows per table
                     cells = []
                     for cell in tr.find_all(['td', 'th']):
                         cell_text = cell.get_text(strip=True)
-                        cells.append(cell_text)
+                        if cell_text:
+                            cells.append(cell_text)
                     if cells:
                         rows.append(cells)
+                
                 if rows:
-                    structured["tables"].append(rows)
+                    structured["tables"].append({
+                        "headers": headers,
+                        "rows": rows
+                    })
             
-            # Extract relevant paragraphs (those containing keywords)
+            # Extract definition lists
+            for dl in soup.find_all('dl'):
+                defs = []
+                for dt in dl.find_all('dt'):
+                    term = dt.get_text(strip=True)
+                    # Get the corresponding dd (definition)
+                    dd = dt.find_next('dd')
+                    if dd:
+                        definition = dd.get_text(strip=True)
+                        defs.append(f"{term}: {definition}")
+                    else:
+                        defs.append(term)
+                if defs:
+                    structured["definitions"].extend(defs[:20])
+            
+            # Extract code blocks
+            for code in soup.find_all(['code', 'pre']):
+                code_text = code.get_text(strip=True)
+                if code_text and len(code_text) > 5:
+                    structured["code_blocks"].append(code_text[:500])  # Limit code block size
+            
+            # Extract relevant paragraphs with ENHANCED filtering
+            extracted_para_count = 0
             for p in soup.find_all('p'):
+                if extracted_para_count >= 30:  # Limit total paragraphs
+                    break
+                    
                 p_text = p.get_text(strip=True)
-                if len(p_text) > 50:  # Skip very short paragraphs
-                    score = calculate_relevance_score(p_text)
-                    if score > 0.3:  # At least 30% keyword match
-                        structured["key_paragraphs"].append(p_text)
+                
+                # Skip very short or very long paragraphs
+                if len(p_text) < 30 or len(p_text) > 2000:
+                    continue
+                
+                score = calculate_relevance_score(p_text)
+                
+                # Include paragraphs if they:
+                # 1. Match keywords significantly (score > 0.3)
+                # 2. OR are not too short and not obviously boilerplate
+                if score > 0.2 or (len(p_text) > 100 and 'click here' not in p_text.lower()):
+                    structured["key_paragraphs"].append(p_text[:500])  # Limit paragraph size
+                    extracted_para_count += 1
             
             return structured
         
-        def extract_internal_links(url: str, html: str, be_inclusive: bool = False) -> List[str]:
-            """Extract internal links that might be worth following.
+        def extract_internal_links(url: str, html: str, current_depth: int) -> List[str]:
+            """ENHANCED: Extract internal links intelligently based on depth level.
+            
+            - At depth 0 (main results): Be very inclusive - explore more breadth
+            - At depth 1-2: Balance between depth and breadth - follow promising links
+            - At depth 3+: Be selective - only follow highly relevant links
             
             Args:
                 url: Current page URL
                 html: Page HTML content
-                be_inclusive: If True, include more links (for first-level exploration)
+                current_depth: Current traversal depth (0 = initial result page)
+            
+            Returns:
+                List of promising internal links, prioritized by relevance
             """
             from bs4 import BeautifulSoup
             from urllib.parse import urljoin, urlparse
             
             soup = BeautifulSoup(html, 'html.parser')
             base_domain = urlparse(url).netloc
-            internal_links = []
-            relevant_links = []  # Prioritized links
+            
+            # Separate links by relevance tier
+            highly_relevant_links = []  # Must follow these
+            relevant_links = []          # Should follow these  
+            other_internal_links = []    # Consider these
             
             for a in soup.find_all('a', href=True):
                 href_raw = a.get('href', '')
@@ -1285,31 +1594,56 @@ class WebSearchAgent:
                 if href.startswith('#') or href.startswith('javascript:'):
                     continue
                     
-                # Skip media files
-                if any(ext in href.lower() for ext in ['.pdf', '.jpg', '.png', '.gif', '.doc', '.xls']):
+                # Skip media files and common non-content URLs
+                if any(ext in href.lower() for ext in ['.pdf', '.jpg', '.png', '.gif', '.doc', '.xls', '.zip', '.exe']):
                     continue
                 
                 # Skip already visited
                 if abs_url in visited_urls:
                     continue
                 
-                # Skip duplicates
-                if abs_url in internal_links or abs_url in relevant_links:
+                # Skip duplicates within this extraction
+                if abs_url in highly_relevant_links or abs_url in relevant_links or abs_url in other_internal_links:
                     continue
                 
-                # Prioritize links that seem relevant
+                # Skip common non-content pages
+                skip_patterns = ['logout', 'login', 'signin', 'signup', 'cart', 'checkout', 'privacy', 'terms', 'cookie', 'about-us', 'contact-us']
+                if any(pattern in abs_url.lower() for pattern in skip_patterns):
+                    continue
+                
+                # Calculate relevance
                 link_relevance = calculate_relevance_score(link_text)
                 href_relevance = any(kw in href.lower() for kw in relevance_keywords)
                 
-                if link_relevance > 0.2 or href_relevance:
+                # Classify link based on relevance signals
+                if href_relevance or link_relevance > 0.4:
+                    # URL contains keyword or link text is very relevant
+                    highly_relevant_links.append(abs_url)
+                elif link_relevance > 0.2:
+                    # Link text somewhat relevant
                     relevant_links.append(abs_url)
-                elif be_inclusive and link_text and len(link_text) > 3:
-                    # Include other navigational links for first-level exploration
-                    internal_links.append(abs_url)
+                elif current_depth == 0 and link_text and len(link_text) > 2:
+                    # At depth 0, also consider general navigation links
+                    other_internal_links.append(abs_url)
             
-            # Combine: relevant links first, then other internal links
-            combined = relevant_links + internal_links
-            return combined[:15]  # Return up to 15 links
+            # ENHANCED STRATEGY: Adjust how many links to return based on depth
+            if current_depth == 0:
+                # At root level: get up to 20 links (10 highly relevant + 10 others)
+                # This creates the foundation for deeper exploration
+                result = highly_relevant_links[:10] + relevant_links[:5] + other_internal_links[:5]
+                logger.debug(f"📊 Depth {current_depth} (ROOT): Found {len(highly_relevant_links)} highly relevant, {len(relevant_links)} relevant, {len(other_internal_links)} general links")
+            elif current_depth <= 2:
+                # At intermediate depth: prioritize relevant links
+                # Return up to 8 links (5 highly relevant + 3 relevant)
+                result = highly_relevant_links[:5] + relevant_links[:3]
+                logger.debug(f"📊 Depth {current_depth} (INTERMEDIATE): Selected {len(highly_relevant_links[:5])} highly relevant, {len(relevant_links[:3])} relevant links")
+            else:
+                # At deep levels (3+): only follow highly relevant links
+                # Return up to 3-4 links
+                result = highly_relevant_links[:4]
+                logger.debug(f"📊 Depth {current_depth} (DEEP): Selected {len(highly_relevant_links[:4])} highly relevant links")
+            
+            return result
         
         def visit_and_extract(url: str, depth: int) -> None:
             """Visit a URL and extract relevant information."""
@@ -1383,20 +1717,29 @@ class WebSearchAgent:
                 
                 # Add structured data to aggregated data even with lower relevance (we're already on the site)
                 if structured_data:
-                    # Always capture lists and tables from target pages
+                    # ENHANCED: Capture all types of structured data
+                    # Lists and tables from target pages
                     if structured_data.get("lists"):
                         all_extracted_data.extend(structured_data["lists"])
                     if structured_data.get("tables"):
                         all_extracted_data.extend(structured_data["tables"])
+                    # NEW: Also capture headings, paragraphs, definitions, and code blocks
+                    if structured_data.get("headings"):
+                        all_extracted_data.extend(structured_data["headings"])
+                    if structured_data.get("key_paragraphs"):
+                        all_extracted_data.extend(structured_data["key_paragraphs"])
+                    if structured_data.get("definitions"):
+                        all_extracted_data.extend(structured_data["definitions"])
+                    if structured_data.get("code_blocks"):
+                        all_extracted_data.extend(structured_data["code_blocks"])
                 
                 # Follow internal links if we haven't reached max depth
                 if depth < max_depth:
-                    # Be more inclusive for first-level exploration (depth 0)
-                    be_inclusive = (depth == 0)
-                    
+                    # ENHANCED: Use new depth-aware link extraction
                     internal_links = []
                     if html_content:
-                        internal_links = extract_internal_links(url, html_content, be_inclusive=be_inclusive)
+                        # Use the ENHANCED depth-aware link extraction
+                        internal_links = extract_internal_links(url, html_content, current_depth=depth)
                     elif scraped_links:
                         # Use links from scrape result when HTML is not available
                         from urllib.parse import urlparse
@@ -1423,15 +1766,18 @@ class WebSearchAgent:
                             
                             # Check relevance
                             link_relevance = calculate_relevance_score(link_text)
-                            if be_inclusive or link_relevance > 0.1 or any(kw in link_url.lower() for kw in relevance_keywords):
+                            # At depth 0, be more inclusive; at deeper levels, be selective
+                            if depth == 0 or link_relevance > 0.1 or any(kw in link_url.lower() for kw in relevance_keywords):
                                 internal_links.append(link_url)
                         
-                        internal_links = internal_links[:15]
+                        internal_links = internal_links[:20]  # Allow more links to be extracted for deep traversal
                     
                     if internal_links:
-                        logger.info(f"Found {len(internal_links)} internal links to explore")
+                        logger.info(f"🔗 Found {len(internal_links)} internal links to explore at depth {depth}")
+                        # ENHANCED: Increase exploration limits for deeper traversal
                         for link in internal_links:
-                            if len(all_findings) < max_results * 3:  # Safety limit
+                            # Allow more pages to be visited for comprehensive exploration
+                            if len(all_findings) < max_results * 5:  # Increased safety limit from 3x to 5x
                                 visit_and_extract(link, depth + 1)
                             
             except Exception as e:
@@ -1445,10 +1791,11 @@ class WebSearchAgent:
                 urls_to_visit = [target_url]
                 logger.info(f"Starting deep search from target URL: {target_url}")
             else:
-                # Perform search first - with automatic retry on empty results
+                # ENHANCED: Perform search first - with automatic retry on empty results
+                # Now requesting more results to have flexibility in selection
                 search_result = self.search(
                     query=query, 
-                    max_results=max_results,
+                    max_results=max(10, max_results * 2),  # Request 2x to ensure we get quality results
                     retry_on_empty=True,  # Enable retry with query reformulation
                     max_retries=3
                 )
@@ -1463,10 +1810,14 @@ class WebSearchAgent:
                         "search_attempts": search_result.get('attempts', [])
                     }
                 
-                # Extract URLs from search results
+                # ENHANCED: Extract URLs from search results - LIMIT TO TOP 5 FOR DEPTH FOCUS
                 results = search_result.get("results", [])
                 urls_to_visit = [r.get("url") or r.get("link") for r in results if r.get("url") or r.get("link")]
-                logger.info(f"Found {len(urls_to_visit)} URLs from search")
+                
+                # CRITICAL: Limit to top 5 results for focused deep exploration
+                urls_to_visit = urls_to_visit[:max_results]
+                logger.info(f"🎯 ENHANCED: Found {len(search_result.get('results', []))} total results, selecting TOP {len(urls_to_visit)} for deep exploration")
+                logger.info(f"🎯 ENHANCED: Will traverse each result up to {max_depth} levels deep")
                 
                 # Include retry info in logs
                 if search_result.get('retry_count', 0) > 0:
@@ -1531,7 +1882,21 @@ class WebSearchAgent:
                     "summary": summary
                 }
             
-            logger.info(f"Deep search complete. Visited {pages_visited} pages, found {len(flattened_data)} items")
+            logger.info(f"✅ ENHANCED DEEP SEARCH COMPLETE:")
+            logger.info(f"   - Visited {pages_visited} pages across {max_depth} depth levels")
+            logger.info(f"   - Top {len(urls_to_visit)} search results explored thoroughly")
+            logger.info(f"   - Extracted {len(flattened_data)} items from all levels")
+            logger.info(f"   - Relevant pages with data: {summary.get('relevant_pages_found', 0)}")
+            
+            # Categorize findings by depth
+            findings_by_depth = {}
+            for f in all_findings:
+                d = f.get('depth', 0)
+                if d not in findings_by_depth:
+                    findings_by_depth[d] = 0
+                findings_by_depth[d] += 1
+            
+            logger.info(f"   - Findings by depth level: {findings_by_depth}")
             
             return {
                 "success": True,
@@ -1541,8 +1906,18 @@ class WebSearchAgent:
                 "summary": summary,
                 "pages_visited": pages_visited,
                 "findings": all_findings,
+                "findings_by_depth": findings_by_depth,  # NEW: Show distribution across depths
                 "extracted_data": flattened_data[:100],  # Limit to 100 items
                 "results_count": len(flattened_data),  # Add for consistency with search()
+                "extraction_stats": {  # NEW: Detailed extraction statistics
+                    "total_findings": len(all_findings),
+                    "depth_0_pages": findings_by_depth.get(0, 0),  # Direct results
+                    "depth_1_pages": findings_by_depth.get(1, 0),  # 1 link deep
+                    "depth_2_pages": findings_by_depth.get(2, 0),  # 2 links deep
+                    "depth_3_pages": findings_by_depth.get(3, 0),  # 3 links deep
+                    "depth_4_plus_pages": sum(v for k, v in findings_by_depth.items() if k >= 4),
+                    "total_extracted_items": len(flattened_data)
+                },
                 "search_completed_at": datetime.now().isoformat()
             }
             
@@ -1777,6 +2152,18 @@ class WebSearchAgent:
                     source=parameters.get('source')
                 )
             
+            elif operation == "paginated_search":
+                logger.debug(f"[WEB SEARCH AGENT] Calling paginated_search() with query='{parameters.get('query', '')}'")
+                result = self.paginated_search(
+                    query=parameters.get('query', ''),
+                    max_results=parameters.get('max_results', 50),
+                    language=parameters.get('language', 'en'),
+                    backend=parameters.get('backend'),
+                    batch_size=parameters.get('batch_size', 5),
+                    max_batches=parameters.get('max_batches', 10),
+                    retry_on_empty=parameters.get('retry_on_empty', True)
+                )
+            
             elif operation == "scrape":
                 logger.debug(f"[WEB SEARCH AGENT] Calling scrape() with url='{parameters.get('url', '')}'")
                 result = self.scrape(
@@ -1869,8 +2256,15 @@ class WebSearchAgent:
             # Return in requested format
             if return_legacy:
                 # Convert back to legacy format for backward compatibility
-                return self._convert_to_legacy_response(standard_response)
+                legacy_response = self._convert_to_legacy_response(standard_response)
+                logger.debug(f"[WEB SEARCH AGENT] execute_task returning LEGACY format")
+                logger.debug(f"[WEB SEARCH AGENT]   keys: {list(legacy_response.keys())}")
+                logger.debug(f"[WEB SEARCH AGENT]   'results' in response: {'results' in legacy_response}")
+                return legacy_response
             else:
+                logger.debug(f"[WEB SEARCH AGENT] execute_task returning STANDARDIZED format")
+                logger.debug(f"[WEB SEARCH AGENT]   response['result'] keys: {list(standard_response.get('result', {}).keys())}")
+                logger.debug(f"[WEB SEARCH AGENT]   'results' in result: {'results' in standard_response.get('result', {})}")
                 return standard_response
         
         except Exception as e:
@@ -1912,6 +2306,12 @@ class WebSearchAgent:
     ) -> AgentExecutionResponse:
         """Convert legacy result dict to standardized AgentExecutionResponse."""
         success = legacy_result.get("success", False)
+        
+        logger.debug(f"[WEB SEARCH AGENT] _convert_to_standard_response called")
+        logger.debug(f"[WEB SEARCH AGENT]   legacy_result keys: {list(legacy_result.keys())}")
+        logger.debug(f"[WEB SEARCH AGENT]   'results' in legacy_result: {'results' in legacy_result}")
+        if 'results' in legacy_result:
+            logger.debug(f"[WEB SEARCH AGENT]   legacy_result['results'] count: {len(legacy_result.get('results', []))}")
         
         # Extract artifacts from result
         artifacts = []
@@ -1976,6 +2376,12 @@ class WebSearchAgent:
             "blackboard_entries": blackboard_entries,
             "warnings": []
         }
+        
+        logger.debug(f"[WEB SEARCH AGENT] _convert_to_standard_response result")
+        logger.debug(f"[WEB SEARCH AGENT]   response['result'] keys: {list(response['result'].keys())}")
+        logger.debug(f"[WEB SEARCH AGENT]   'results' in response['result']: {'results' in response['result']}")
+        if 'results' in response['result']:
+            logger.debug(f"[WEB SEARCH AGENT]   response['result']['results'] count: {len(response['result'].get('results', []))}")
         
         # Add error field if present (handle TypedDict)
         if not success and "error" in legacy_result:

@@ -733,65 +733,84 @@ class TaskManagerAgent:
         depth_limit = state.get('depth_limit', 5)
         task_description = task.get('description', '').lower()
         
+        # Check if this is a document/creation type task (should NOT be forced as research)
+        document_keywords = ['document', 'docx', 'txt', 'create', 'write', 'format', 'file', 
+                           'report', 'summary', 'output']
+        is_document_task = any(keyword in task_description for keyword in document_keywords)
+        
         # Check if this is a research/search type task
         research_keywords = ['search', 'research', 'find', 'identify', 'list', 'trends', 
                             'sources', 'information', 'data', 'latest', 'current', 'industry']
         is_research_task = any(keyword in task_description for keyword in research_keywords)
         
+        # If it's a document task, don't classify it as research even if it has research keywords
+        if is_document_task:
+            is_research_task = False
+        
         # Force execution at depth 2 for research tasks, depth 3 for others
         force_execution_depth = 2 if is_research_task else 3
         
         if current_depth >= force_execution_depth:
-            logger.warning(f"[ANALYZE] Task at depth {current_depth} ({'research' if is_research_task else 'general'}) - FORCING EXECUTION to prevent infinite breakdown")
-            # Force execute_web_search_task execution for research tasks or execute_problem_solver_task for analysis
-            if is_research_task:
-                action_name = "execute_web_search_task"
-                file_op = {
-                    "type": "web_search",
-                    "operation": "search",
-                    "parameters": {
-                        "query": task.get('description', ''),
-                        "num_results": 5
-                    }
-                }
+            logger.warning(f"[ANALYZE] Task at depth {current_depth} ({'research' if is_research_task else 'document' if is_document_task else 'general'}) - checking if forced execution needed")
+            
+            # Don't force execution for document tasks - let LLM analyze them normally
+            if is_document_task:
+                logger.info(f"[ANALYZE] Document task detected - allowing normal LLM analysis instead of forced execution")
+                # Fall through to normal analysis below
+                pass
             else:
-                action_name = "execute_problem_solver_task"
-                file_op = None
-            
-            analysis = {
-                "action": action_name,
-                "reasoning": f"Task at depth {current_depth} - forcing execution to prevent excessive decomposition",
-                "subtasks": None,
-                "search_query": task.get('description', '') if is_research_task else None,
-                "file_operation": file_op,
-                "estimated_complexity": "medium",
-                "requires_human_review": False
-            }
-            
-            logger.info(f"[ANALYZE] Forced analysis action: {analysis['action']}")
-            
-            updated_task: Task = {
-                **task,
-                "status": TaskStatus.ANALYZING,
-                "result": analysis,
-                "updated_at": datetime.now().isoformat()
-            }
-            
-            updated_tasks: List[Task] = [
-                updated_task if t['id'] == task_id else t
-                for t in state['tasks']
-            ]
-            
-            logger.info(f"[ANALYZE] ✓ Task {task_id} forced to execute - returning updated state")
-            
-            result_state: AgentState = {
-                **state,
-                "tasks": updated_tasks,
-                "requires_human_review": False
-            }
-            
-            self.tracer.record_state_snapshot("analyze_task", dict(result_state), phase="exit", notes=f"Forced execution at depth {current_depth}")
-            return result_state
+                logger.warning(f"[ANALYZE] Non-document task at depth {current_depth} - FORCING EXECUTION to prevent infinite breakdown")
+                # Force execute_web_search_task execution for research tasks or execute_problem_solver_task for analysis
+                if is_research_task:
+                    action_name = "execute_web_search_task"
+                    file_op = {
+                        "type": "web_search",
+                        "operation": "search",
+                        "parameters": {
+                            "query": task.get('description', ''),
+                            "num_results": 5
+                        }
+                    }
+                else:
+                    action_name = "execute_problem_solver_task"
+                    file_op = None
+                
+                analysis = {
+                    "action": action_name,
+                    "reasoning": f"Task at depth {current_depth} - forcing execution to prevent excessive decomposition",
+                    "subtasks": None,
+                    "search_query": task.get('description', '') if is_research_task else None,
+                    "file_operation": file_op,
+                    "estimated_complexity": "medium",
+                    "requires_human_review": False
+                }
+                
+                logger.info(f"[ANALYZE] Forced analysis action: {analysis['action']}")
+                
+                updated_task: Task = {
+                    **task,
+                    "status": TaskStatus.ANALYZING,
+                    "result": analysis,
+                    "updated_at": datetime.now().isoformat()
+                }
+                
+                updated_tasks: List[Task] = [
+                    updated_task if t['id'] == task_id else t
+                    for t in state['tasks']
+                ]
+                
+                logger.info(f"[ANALYZE] ✓ Task {task_id} forced to execute - returning updated state")
+                
+                result_state: AgentState = {
+                    **state,
+                    "tasks": updated_tasks,
+                    "requires_human_review": False
+                }
+                
+                self.tracer.record_state_snapshot("analyze_task", dict(result_state), phase="exit", notes=f"Forced execution at depth {current_depth}")
+                return result_state
+        else:
+            logger.debug(f"[ANALYZE] Task at depth {current_depth} below force execution threshold ({force_execution_depth})")
         
         # Build analysis prompt using PromptBuilder (with input context)
         analysis_prompt = PromptBuilder.build_analysis_prompt(
@@ -2210,6 +2229,11 @@ class TaskManagerAgent:
                 logger.debug(f"[WEB SEARCH AGENT] execute_task() returned successfully")
                 logger.debug(f"[WEB SEARCH AGENT] Response type: {type(response)}")
                 logger.debug(f"[WEB SEARCH AGENT] Response keys: {list(response.keys()) if isinstance(response, dict) else 'N/A'}")
+                logger.debug(f"[WEB SEARCH AGENT] Response['success']: {response.get('success')}")
+                logger.debug(f"[WEB SEARCH AGENT] Response['result'] keys: {list(response.get('result', {}).keys()) if isinstance(response.get('result'), dict) else type(response.get('result'))}")
+                logger.debug(f"[WEB SEARCH AGENT] Response['result']['results'] exists: {'results' in response.get('result', {})}")
+                if 'results' in response.get('result', {}):
+                    logger.debug(f"[WEB SEARCH AGENT] Response['result']['results'] count: {len(response['result']['results'])}")
             except Exception as web_search_ex:
                 logger.error(f"[WEB SEARCH AGENT] ✗ EXCEPTION during execute_task(): {str(web_search_ex)}")
                 logger.error(f"[WEB SEARCH AGENT] Exception type: {type(web_search_ex).__name__}")
@@ -2229,59 +2253,109 @@ class TaskManagerAgent:
                 }
             
             # Extract legacy-compatible result_data from standardized response
+            # Ensure response has the expected structure
+            response_result = response.get('result', {})
+            if not isinstance(response_result, dict):
+                response_result = {}
+            
+            # Debug: Log response structure before processing
+            logger.debug(f"[WEB SEARCH AGENT] Response keys: {list(response.keys()) if isinstance(response, dict) else type(response)}")
+            logger.debug(f"[WEB SEARCH AGENT] Response['result'] is dict: {isinstance(response.get('result'), dict)}")
+            logger.debug(f"[WEB SEARCH AGENT] Response['result'] is None: {response.get('result') is None}")
+            logger.debug(f"[WEB SEARCH AGENT] Response['result'] value: {response.get('result')}")
+            
             result_data = {
-                'success': response['success'],
-                'summary': response['result'].get('summary', ''),
-                'results_count': response['result'].get('results_count', 0),
-                **response['result']  # Include all other result fields
+                'success': response.get('success', False),
+                'summary': response_result.get('summary', ''),
+                'results_count': response_result.get('results_count', 0),
+                **response_result  # Include all other result fields
             }
+            
+            # DEBUG: Log what we received from the response
+            logger.debug(f"[WEB SEARCH AGENT] Response result keys: {list(response_result.keys())}")
+            logger.debug(f"[WEB SEARCH AGENT] Result data keys after merge: {list(result_data.keys())}")
+            logger.debug(f"[WEB SEARCH AGENT] 'results' in result_data: {'results' in result_data}")
+            logger.debug(f"[WEB SEARCH AGENT] 'extracted_data' in result_data: {'extracted_data' in result_data}")
+            if 'results' in result_data:
+                logger.debug(f"[WEB SEARCH AGENT] results count: {len(result_data.get('results', []))}")
+                if result_data.get('results'):
+                    logger.debug(f"[WEB SEARCH AGENT] First result: {result_data['results'][0]}")
+            else:
+                logger.warning(f"[WEB SEARCH AGENT] ⚠️ WARNING: 'results' field NOT in result_data!")
+                logger.warning(f"[WEB SEARCH AGENT]   This means data from search operation was not preserved")
+                logger.warning(f"[WEB SEARCH AGENT]   Available fields: {list(result_data.keys())}")
+                logger.warning(f"[WEB SEARCH AGENT]   Response['result'] fields: {list(response.get('result', {}).keys())}")
             
             # NORMALIZATION: For regular search operations, convert 'results' to 'extracted_data' and 'findings'
             # This ensures consistency with deep_search output format for downstream processing
-            if operation == 'search' and 'results' in result_data and 'extracted_data' not in result_data:
-                # Convert search results to extracted_data format
-                search_results = result_data.get('results', [])
+            if operation == 'search':
+                # Check if we have results but not extracted_data/findings
+                # This includes cases where results exists alongside extracted_data
+                if 'results' in result_data:
+                    search_results = result_data.get('results', [])
+                    logger.info(f"[WEB SEARCH AGENT] Normalizing search results to extracted_data format")
+                    
+                    # Always ensure extracted_data is properly set from results
+                    if not result_data.get('extracted_data'):
+                        # Create extracted_data from snippets (with fallback fields in case of naming differences)
+                        result_data['extracted_data'] = []
+                        for r in search_results:
+                            # Try snippet field first, then fall back to body, then title
+                            snippet = r.get('snippet', '') or r.get('body', '') or r.get('title', '')
+                            if isinstance(snippet, str) and snippet.strip():
+                                result_data['extracted_data'].append(snippet)
+                    
+                    # Always ensure findings is properly set from results
+                    if not result_data.get('findings'):
+                        # Create findings from full result objects
+                        result_data['findings'] = []
+                        for r in search_results:
+                            snippet = r.get('snippet', '') or r.get('body', '') or r.get('title', '')
+                            # Only include findings that have at least a URL or title
+                            if r.get('url', '') or r.get('title', ''):
+                                result_data['findings'].append({
+                                    'url': r.get('url', ''),
+                                    'title': r.get('title', ''),
+                                    'relevance_score': 0.8,  # Regular search results are considered highly relevant
+                                    'text_preview': (snippet[:500] if isinstance(snippet, str) else str(snippet)[:500])
+                                })
+                    
+                    # Generate summary if empty
+                    if not result_data.get('summary'):
+                        result_data['summary'] = {
+                            'query': result_data.get('query', ''),
+                            'total_results': len(search_results),
+                            'top_sources': [r.get('url', '') for r in search_results[:5] if r.get('url', '')],
+                            'snippet_count': len(result_data.get('extracted_data', []))
+                        }
+                    
+                    logger.info(f"[WEB SEARCH AGENT] Normalized search results: {len(result_data.get('extracted_data', []))} items, {len(result_data.get('findings', []))} findings")
                 
-                # Create extracted_data from snippets (with fallback fields in case of naming differences)
-                result_data['extracted_data'] = []
-                for r in search_results:
-                    # Try snippet field first, then fall back to body, then title
-                    snippet = r.get('snippet', '') or r.get('body', '') or r.get('title', '')
-                    if isinstance(snippet, str) and snippet.strip():
-                        result_data['extracted_data'].append(snippet)
-                
-                # Create findings from full result objects  
-                result_data['findings'] = []
-                for r in search_results:
-                    snippet = r.get('snippet', '') or r.get('body', '') or r.get('title', '')
-                    # Only include findings that have at least a URL or title
-                    if r.get('url', '') or r.get('title', ''):
-                        result_data['findings'].append({
-                            'url': r.get('url', ''),
-                            'title': r.get('title', ''),
-                            'relevance_score': 0.8,  # Regular search results are considered highly relevant
-                            'text_preview': (snippet[:500] if isinstance(snippet, str) else str(snippet)[:500])
-                        })
-                
-                # Generate summary if empty
-                if not result_data.get('summary'):
-                    result_data['summary'] = {
-                        'query': result_data.get('query', ''),
-                        'total_results': len(search_results),
-                        'top_sources': [r.get('url', '') for r in search_results[:5] if r.get('url', '')],
-                        'snippet_count': len(result_data['extracted_data'])
-                    }
-                
-                logger.debug(f"[WEB SEARCH AGENT] Normalized search results: {len(result_data['extracted_data'])} items, {len(result_data['findings'])} findings")
-                
-                # CRITICAL: Ensure we have data after normalization
-                if result_data.get('results_count', 0) > 0 and not result_data.get('extracted_data', []):
-                    logger.warning(f"[WEB SEARCH AGENT] WARNING: results_count={result_data.get('results_count')} but extracted_data is empty after normalization!")
-                    logger.warning(f"[WEB SEARCH AGENT] Sample result structure: {search_results[0] if search_results else 'N/A'}")
-                    # Try alternate approach - if all else fails, use stringified results
-                    if search_results:
-                        result_data['extracted_data'] = [str(r) for r in search_results]
-                        result_data['findings'] = [{'url': str(idx), 'title': str(r), 'relevance_score': 0.8} for idx, r in enumerate(search_results)]
+                elif not result_data.get('extracted_data') and not result_data.get('findings'):
+                    # Neither results nor extracted_data/findings exist - this is problematic
+                    logger.error(f"[WEB SEARCH AGENT] ✗ CRITICAL: Neither 'results' nor 'extracted_data' found!")
+                    logger.error(f"[WEB SEARCH AGENT]   Result data keys: {list(result_data.keys())}")
+                    logger.error(f"[WEB SEARCH AGENT]   This indicates data was lost in conversion")
+                    logger.error(f"[WEB SEARCH AGENT]   results_count={result_data.get('results_count')} but no data to extract")
+                    # Create empty extracted_data as fallback
+                    result_data['extracted_data'] = []
+                    result_data['findings'] = []
+            
+            # ENSURE deep_search results have properly formatted findings
+            # deep_search returns 'findings' field which we should keep, but also ensure it's treated correctly
+            if operation == 'deep_search' and 'findings' not in result_data:
+                # If deep_search didn't return findings, create them from extracted_data
+                extracted = result_data.get('extracted_data', [])
+                if extracted and isinstance(extracted, list):
+                    result_data['findings'] = [
+                        {
+                            'url': f"finding_{idx}",
+                            'title': str(item)[:100] if isinstance(item, str) else str(item)[:100],
+                            'relevance_score': 0.8,
+                            'text_preview': str(item)[:500]
+                        }
+                        for idx, item in enumerate(extracted[:20])  # Keep top 20 findings
+                    ]
             
             # Update task with results
             updated_task = {
@@ -2352,6 +2426,34 @@ class TaskManagerAgent:
                 if results_count == 0 and task_success:
                     logger.warning(f"[WEB SEARCH AGENT] ⚠ WARNING: Task marked successful but 0 results found")
             
+            # CRITICAL VALIDATION: Before storing in blackboard, verify extracted_data exists
+            extracted_data = result_data.get('extracted_data', [])
+            findings = result_data.get('findings', [])
+            
+            if result_data.get('success') and result_data.get('results_count', 0) > 0:
+                # Successful search with reported results - MUST have extracted_data or findings
+                if not extracted_data and not findings:
+                    logger.error(f"[WEB SEARCH AGENT] ✗✗✗ DATA INTEGRITY ERROR ✗✗✗")
+                    logger.error(f"[WEB SEARCH AGENT] Task {task_id} reports {result_data.get('results_count')} results")
+                    logger.error(f"[WEB SEARCH AGENT] But extracted_data is empty and findings is empty!")
+                    logger.error(f"[WEB SEARCH AGENT] Result data keys: {list(result_data.keys())}")
+                    logger.error(f"[WEB SEARCH AGENT] This is a CRITICAL BUG that must be fixed")
+                    logger.error(f"[WEB SEARCH AGENT] Attempting recovery...")
+                    
+                    # Try to recover: check if 'results' field exists and rebuild
+                    if 'results' in result_data:
+                        raw_results = result_data['results']
+                        logger.info(f"[WEB SEARCH AGENT] Found {len(raw_results)} raw results, rebuilding extracted_data")
+                        rebuilt = []
+                        for r in raw_results:
+                            snippet = r.get('snippet', '') or r.get('body', '') or r.get('title', '')
+                            if isinstance(snippet, str) and snippet.strip():
+                                rebuilt.append(snippet)
+                        if rebuilt:
+                            result_data['extracted_data'] = rebuilt
+                            extracted_data = rebuilt
+                            logger.info(f"[WEB SEARCH AGENT] Recovery successful: {len(rebuilt)} items restored")
+            
             # Create blackboard entry with findings and chain markers
             blackboard_entry: BlackboardEntry = {
                 "entry_type": "web_search_result",
@@ -2365,8 +2467,8 @@ class TaskManagerAgent:
                     "summary": result_data.get('summary', ''),
                     # Include deep_search specific data
                     "pages_visited": result_data.get('pages_visited', 0),
-                    "extracted_data": result_data.get('extracted_data', [])[:50],  # Limit for blackboard
-                    "findings": result_data.get('findings', [])[:10],  # Top findings
+                    "extracted_data": extracted_data[:50],  # Limit for blackboard
+                    "findings": findings[:10],  # Top findings
                 },
                 "timestamp": datetime.now().isoformat(),
                 "relevant_to": [task_id],
@@ -2376,8 +2478,13 @@ class TaskManagerAgent:
             }
             
             # Check for CSV file generation (chain to Excel condition)
-            output_files = result_data.get('output', {}).get('generated_files', {})
-            csv_file = output_files.get('csv')
+            output_section = result_data.get('output', {})
+            if isinstance(output_section, dict):
+                output_files = output_section.get('generated_files', {})
+            else:
+                output_files = {}
+            
+            csv_file = output_files.get('csv') if isinstance(output_files, dict) else None
             
             if csv_file:
                 logger.info(f"[WEB SEARCH AGENT] 🔗 CHAIN DETECTION: Generated CSV file")
