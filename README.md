@@ -2,7 +2,7 @@
 
 A LangGraph-based orchestration system that recursively decomposes complex objectives and executes specialized sub-agents (PDF, Excel, OCR, WebSearch, CodeInterpreter) with intelligent coordination through blackboard pattern knowledge sharing.
 
-**Version**: 2.5 | **Status**: Production Ready ✅
+**Version**: 2.5 | **Status**: Beta ✅
 
 ## Features
 
