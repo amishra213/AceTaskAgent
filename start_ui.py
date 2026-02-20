@@ -48,13 +48,17 @@ def main():
 ║   Monitor:      http://{args.host}:{args.port}/#monitor     ║
 ║   Alerts:       http://{args.host}:{args.port}/#alerts      ║
 ║                                                          ║
+║   Press Ctrl+C to stop the server                        ║
+║                                                          ║
 ╚══════════════════════════════════════════════════════════╝
     """)
 
+    # Run in foreground (blocking) - press Ctrl+C to stop
     uvicorn.run(
         "ui.server:app",
         host=args.host,
         port=args.port,
+        workers=1,  # Single worker - foreground execution
         reload=args.reload,
         log_level="info",
     )

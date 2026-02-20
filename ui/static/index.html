@@ -24,7 +24,7 @@
             <i data-lucide="layout-dashboard"></i><span>Dashboard</span>
         </a></li>
         <li><a href="#" data-page="designer" class="nav-link">
-            <i data-lucide="workflow"></i><span>Workflow Designer</span>
+            <i data-lucide="workflow"></i><span>Designer</span>
         </a></li>
         <li><a href="#" data-page="executions" class="nav-link">
             <i data-lucide="play-circle"></i><span>Executions</span>
@@ -55,8 +55,15 @@
     <!-- =========== DASHBOARD PAGE =========== -->
     <section id="page-dashboard" class="page active">
         <header class="page-header">
-            <h1>Dashboard</h1>
-            <p class="subtitle">Overview of your workflow operations</p>
+            <div class="header-left">
+                <h1>Dashboard</h1>
+                <p class="subtitle">Overview of your workflow operations</p>
+            </div>
+            <div class="header-actions">
+                <button id="ai-chat-toggle" onclick="AIChat.toggle()" class="ai-chat-btn" title="AI Assistant">
+                    <i data-lucide="bot"></i>
+                </button>
+            </div>
         </header>
 
         <div class="stats-grid">
@@ -150,6 +157,9 @@
                 <button class="btn btn-success" id="btn-run-workflow" onclick="Designer.runWorkflow()">
                     <i data-lucide="play"></i> Run
                 </button>
+                <button id="ai-chat-toggle-designer" onclick="AIChat.toggle()" class="ai-chat-btn" title="AI Assistant">
+                    <i data-lucide="bot"></i>
+                </button>
             </div>
         </header>
 
@@ -204,8 +214,18 @@
     <!-- =========== EXECUTIONS PAGE =========== -->
     <section id="page-executions" class="page">
         <header class="page-header">
-            <h1>Executions</h1>
-            <p class="subtitle">Track and manage workflow runs</p>
+            <div class="header-left">
+                <h1>Executions</h1>
+                <p class="subtitle">Track and manage workflow runs</p>
+            </div>
+            <div class="header-actions">
+                <button class="btn btn-outline" onclick="Executions.refresh()">
+                    <i data-lucide="refresh-cw"></i> Refresh
+                </button>
+                <button id="ai-chat-toggle-exec" onclick="AIChat.toggle()" class="ai-chat-btn" title="AI Assistant">
+                    <i data-lucide="bot"></i>
+                </button>
+            </div>
         </header>
 
         <div class="executions-toolbar">
@@ -215,9 +235,6 @@
                 <button class="filter-btn" data-filter="completed">Completed</button>
                 <button class="filter-btn" data-filter="failed">Failed</button>
             </div>
-            <button class="btn btn-outline" onclick="Executions.refresh()">
-                <i data-lucide="refresh-cw"></i> Refresh
-            </button>
         </div>
 
         <div id="executions-list" class="executions-list">
@@ -231,8 +248,15 @@
     <!-- =========== MONITOR PAGE =========== -->
     <section id="page-monitor" class="page">
         <header class="page-header">
-            <h1>Monitor</h1>
-            <p class="subtitle">Real-time execution monitoring</p>
+            <div class="header-left">
+                <h1>Monitor</h1>
+                <p class="subtitle">Real-time execution monitoring</p>
+            </div>
+            <div class="header-actions">
+                <button id="ai-chat-toggle-monitor" onclick="AIChat.toggle()" class="ai-chat-btn" title="AI Assistant">
+                    <i data-lucide="bot"></i>
+                </button>
+            </div>
         </header>
 
         <div id="monitor-content">
@@ -280,6 +304,9 @@
                 <button class="btn btn-outline" onclick="Alerts.clearAll()">
                     <i data-lucide="trash-2"></i> Clear All
                 </button>
+                <button id="ai-chat-toggle-alerts" onclick="AIChat.toggle()" class="ai-chat-btn" title="AI Assistant">
+                    <i data-lucide="bot"></i>
+                </button>
             </div>
         </header>
 
@@ -302,12 +329,6 @@
     </section>
 
 </main>
-
-<!-- =========== AI CHAT TOGGLE BUTTON (top-right) =========== -->
-<button id="ai-chat-toggle" onclick="AIChat.toggle()" title="AI Assistant">
-    <i data-lucide="bot"></i>
-    <span class="chat-badge"></span>
-</button>
 
 <!-- =========== AI CHAT PANEL =========== -->
 <div id="ai-chat-panel">

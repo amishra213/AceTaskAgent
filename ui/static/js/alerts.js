@@ -4,7 +4,7 @@
 
 const Alerts = {
     alerts: [],
-    filter: 'all',
+    currentFilter: 'all',
 
     async load() {
         try {
@@ -18,7 +18,7 @@ const Alerts = {
     },
 
     filter(severity) {
-        this.filter = severity;
+        this.currentFilter = severity;
         document.querySelectorAll('#page-alerts .filter-btn').forEach(b => {
             b.classList.toggle('active', b.dataset.filter === severity);
         });
@@ -29,15 +29,15 @@ const Alerts = {
         const el = document.getElementById('alerts-list');
         let list = this.alerts;
 
-        if (this.filter !== 'all') {
-            list = list.filter(a => a.severity === this.filter);
+        if (this.currentFilter !== 'all') {
+            list = list.filter(a => a.severity === this.currentFilter);
         }
 
         if (list.length === 0) {
             el.innerHTML = `
                 <div class="empty-state">
                     <i data-lucide="bell-off"></i>
-                    <p>${this.filter === 'all' ? 'No alerts at this time' : `No ${this.filter} alerts`}</p>
+                    <p>${this.currentFilter === 'all' ? 'No alerts at this time' : `No ${this.currentFilter} alerts`}</p>
                 </div>
             `;
             lucide.createIcons();

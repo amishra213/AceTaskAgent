@@ -11,15 +11,12 @@ const AIChat = {
     toggle() {
         this.isOpen = !this.isOpen;
         const panel = document.getElementById('ai-chat-panel');
-        const toggle = document.getElementById('ai-chat-toggle');
 
         if (this.isOpen) {
             panel.classList.add('open');
-            toggle.style.display = 'none';
             document.getElementById('chat-input').focus();
         } else {
             panel.classList.remove('open');
-            toggle.style.display = 'flex';
         }
         lucide.createIcons();
     },

@@ -961,40 +961,38 @@ select.form-input {
 }
 
 /* ============================================================
-   AI CHAT WIDGET - Floating chat bubble & panel
+   AI CHAT WIDGET - Button & slide-out panel
    ============================================================ */
 
-/* ---------- Chat Toggle Button (top-right corner) ---------- */
-#ai-chat-toggle {
-    position: fixed;
-    top: 16px;
-    right: 16px;
-    z-index: 800;
-    width: 46px;
-    height: 46px;
+/* ---------- AI Chat Toggle Button ---------- */
+.ai-chat-btn {
+    width: 40px;
+    height: 40px;
     border-radius: 50%;
     background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
     border: 2px solid rgba(255,255,255,0.15);
     color: #fff;
-    display: flex;
+    display: inline-flex;
     align-items: center;
     justify-content: center;
     cursor: pointer;
-    box-shadow: 0 4px 16px rgba(59,130,246,0.35);
+    box-shadow: 0 3px 12px rgba(59,130,246,0.3);
     transition: all 0.25s ease;
+    flex-shrink: 0;
+    position: relative;
 }
 
-#ai-chat-toggle:hover {
+.ai-chat-btn:hover {
     transform: scale(1.1);
-    box-shadow: 0 6px 24px rgba(59,130,246,0.5);
+    box-shadow: 0 5px 20px rgba(59,130,246,0.45);
 }
 
-#ai-chat-toggle i, #ai-chat-toggle svg {
-    width: 22px;
-    height: 22px;
+.ai-chat-btn i, .ai-chat-btn svg {
+    width: 20px;
+    height: 20px;
 }
 
-#ai-chat-toggle .chat-badge {
+.ai-chat-btn .chat-badge {
     position: absolute;
     top: -4px;
     right: -4px;
