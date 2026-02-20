@@ -1,0 +1,41 @@
+{
+  "id": "24a71b3b-95cd-4fd2-a20c-d2142d5dc6a0",
+  "name": "Test Workflow",
+  "description": "Testing",
+  "nodes": [
+    {
+      "id": "n1",
+      "type": "web_search",
+      "label": "Web Search",
+      "x": 100,
+      "y": 200,
+      "config": {},
+      "description": ""
+    },
+    {
+      "id": "n2",
+      "type": "document",
+      "label": "Report",
+      "x": 400,
+      "y": 200,
+      "config": {},
+      "description": ""
+    }
+  ],
+  "edges": [
+    {
+      "id": "e1",
+      "source": "n1",
+      "target": "n2",
+      "condition": "",
+      "label": ""
+    }
+  ],
+  "created_at": "2026-02-20T14:56:45.275258",
+  "updated_at": "2026-02-20T14:56:45.275258",
+  "version": 1,
+  "tags": [
+    "test"
+  ],
+  "status": "draft"
+}

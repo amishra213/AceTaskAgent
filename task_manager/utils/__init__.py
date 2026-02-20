@@ -4,6 +4,7 @@ Utilities module - Helper functions and utilities
 
 from .logger import get_logger
 from .comprehensive_logger import ComprehensiveLogger, TaskLogger
+from .ai_context_logger import AIContextLogger, get_ai_logger, ai_log_info, ai_log_error, ai_log_warning, LogCategory
 from .prompt_builder import PromptBuilder
 from .llm_client import LLMClient, ResponseWrapper
 from .rate_limiter import RateLimiter, global_rate_limiter
@@ -75,6 +76,12 @@ __all__ = [
     'get_logger',
     'ComprehensiveLogger',
     'TaskLogger',
+    'AIContextLogger',
+    'get_ai_logger',
+    'ai_log_info',
+    'ai_log_error',
+    'ai_log_warning',
+    'LogCategory',
     'PromptBuilder',
     'LLMClient',
     'ResponseWrapper',

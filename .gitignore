@@ -29,6 +29,11 @@ ENV/
 env/
 .venv
 
+# Secrets / local config (contains API keys - never commit)
+.env
+.env.local
+config.properties
+
 # IDE
 .vscode/
 .idea/
