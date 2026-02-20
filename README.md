@@ -1,4 +1,4 @@
-# TaskManager - Recursive Multi-Agent Task Orchestration System
+# Ace Task Agent - Recursive Multi-Agent Task Orchestration System
 
 A LangGraph-based orchestration system that recursively decomposes complex objectives and executes specialized sub-agents (PDF, Excel, OCR, WebSearch, CodeInterpreter) with intelligent coordination through blackboard pattern knowledge sharing.
 
