@@ -9,6 +9,7 @@ Bridges the UI with the TaskManagerAgent, providing:
 
 import uuid
 import asyncio
+import importlib
 import threading
 import traceback
 from pathlib import Path
@@ -16,6 +17,36 @@ from datetime import datetime
 from typing import Dict, List, Optional, Any, Callable
 from dataclasses import dataclass, field, asdict
 from enum import Enum
+
+# ---------------------------------------------------------------------------
+# Sub-agent registry: agent_type -> (module_path, class_name, default_op)
+# Loaded lazily so heavy dependencies don't block server startup.
+# ---------------------------------------------------------------------------
+_SUB_AGENT_REGISTRY: Dict[str, tuple] = {
+    "web_search":       ("task_manager.sub_agents.web_search_agent",      "WebSearchAgent",       "search"),
+    "pdf":              ("task_manager.sub_agents.pdf_agent",              "PDFAgent",             "extract_text"),
+    "excel":            ("task_manager.sub_agents.excel_agent",            "ExcelAgent",           "analyze"),
+    "ocr":              ("task_manager.sub_agents.ocr_image_agent",        "OCRImageAgent",        "extract_text"),
+    "code_interpreter": ("task_manager.sub_agents.code_interpreter_agent", "CodeInterpreterAgent", "execute_code"),
+    "data_extraction":  ("task_manager.sub_agents.data_extraction_agent",  "DataExtractionAgent",  "extract"),
+    "problem_solver":   ("task_manager.sub_agents.problem_solver_agent",   "ProblemSolverAgent",   "analysis"),
+    "document":         ("task_manager.sub_agents.document_agent",         "DocumentAgent",        "generate_report"),
+    "mermaid":          ("task_manager.sub_agents.mermaid_agent",          "MermaidAgent",         "generate_diagram"),
+}
+
+
+def _load_sub_agent(agent_type: str):
+    """Instantiate a sub-agent by type string. Returns (instance, default_op) or None."""
+    entry = _SUB_AGENT_REGISTRY.get(agent_type)
+    if not entry:
+        return None, None
+    module_path, class_name, default_op = entry
+    try:
+        mod = importlib.import_module(module_path)
+        cls = getattr(mod, class_name)
+        return cls(), default_op
+    except Exception:
+        return None, default_op
 
 
 class ExecutionStatus(str, Enum):
@@ -378,13 +409,64 @@ class ExecutionEngine:
                             task: TaskProgress, nodes: List[dict],
                             edges: List[dict]) -> Any:
         """
-        Execute a single task. Tries to use the real TaskManagerAgent sub-agents
-        if available, otherwise simulates execution.
+        Execute a single task.
+
+        1. Attempts to invoke the matching real sub-agent via execute_task().
+        2. Falls back to a timed simulation if the sub-agent is unavailable or
+           the agent_type is unrecognised.
         """
         node_config = next((n for n in nodes if n.get("id") == task.task_id), {})
         agent_type = task.agent_type
 
-        # Simulate progressive execution with status updates
+        # ------------------------------------------------------------------ #
+        # Try real sub-agent                                                   #
+        # ------------------------------------------------------------------ #
+        agent_instance, default_op = await asyncio.get_event_loop().run_in_executor(
+            None, _load_sub_agent, agent_type
+        )
+
+        if agent_instance is not None:
+            operation = node_config.get("config", {}).get("operation", default_op) or default_op
+            request = {
+                "task_id": task.task_id,
+                "task_description": instance.objective,
+                "task_type": "atomic",
+                "operation": operation,
+                "parameters": node_config.get("config", {}),
+                "input_data": node_config.get("input_data", {}),
+                "temp_folder": str(Path("./temp_folder").resolve()),
+                "output_folder": str(Path("./output_folder").resolve()),
+                "cache_enabled": True,
+                "blackboard": [],
+                "relevant_entries": [],
+                "max_retries": 1,
+                "timeout_seconds": 120,
+            }
+
+            # Emit incremental progress updates while real agent runs
+            async def _progress_ticker():
+                for pct in [20, 40, 60, 80]:
+                    await asyncio.sleep(1.0)
+                    task.progress = float(pct)
+                    await self._notify("task_progress", {
+                        "execution_id": instance.id,
+                        "task_id": task.task_id,
+                        "progress": task.progress,
+                    })
+
+            ticker = asyncio.create_task(_progress_ticker())
+            try:
+                result = await asyncio.get_event_loop().run_in_executor(
+                    None, agent_instance.execute_task, request
+                )
+            finally:
+                ticker.cancel()
+
+            return result
+
+        # ------------------------------------------------------------------ #
+        # Simulation fallback (unknown agent_type or unavailable dependency)  #
+        # ------------------------------------------------------------------ #
         steps = 5
         for step in range(steps):
             if instance.status == ExecutionStatus.CANCELLED.value:
@@ -402,7 +484,7 @@ class ExecutionEngine:
             "agent": agent_type,
             "task": task.name,
             "status": "success",
-            "output": f"Task '{task.name}' completed by {agent_type} agent",
+            "output": f"[simulated] Task '{task.name}' completed by {agent_type} agent",
         }
 
     def _topological_sort(self, nodes: List[dict], edges: List[dict]) -> List[str]:

@@ -119,6 +119,14 @@ class AlertAck(BaseModel):
     alert_id: str
 
 
+class AgentRunRequest(BaseModel):
+    objective: str
+    operation: str = "search"
+    parameters: dict = {}
+    input_data: dict = {}
+    timeout_seconds: int = 60
+
+
 class AIChatMessage(BaseModel):
     role: str = "user"
     content: str
@@ -443,6 +451,156 @@ async def list_agents():
             },
         ]
     }
+
+
+# ============================================================================
+# AGENT DETAIL & DIRECT RUN API
+# ============================================================================
+
+# Sub-agent registry: type -> (module_path, class_name, default_operation)
+_AGENT_REGISTRY = {
+    "web_search":       ("task_manager.sub_agents.web_search_agent",     "WebSearchAgent",       "search"),
+    "pdf":              ("task_manager.sub_agents.pdf_agent",             "PDFAgent",             "extract_text"),
+    "excel":            ("task_manager.sub_agents.excel_agent",           "ExcelAgent",           "analyze"),
+    "ocr":              ("task_manager.sub_agents.ocr_image_agent",       "OCRImageAgent",        "extract_text"),
+    "code_interpreter": ("task_manager.sub_agents.code_interpreter_agent","CodeInterpreterAgent", "execute_code"),
+    "data_extraction":  ("task_manager.sub_agents.data_extraction_agent", "DataExtractionAgent",  "extract"),
+    "problem_solver":   ("task_manager.sub_agents.problem_solver_agent",  "ProblemSolverAgent",   "analysis"),
+    "document":         ("task_manager.sub_agents.document_agent",        "DocumentAgent",        "generate_report"),
+    "mermaid":          ("task_manager.sub_agents.mermaid_agent",         "MermaidAgent",         "generate_diagram"),
+}
+
+_CORE_AGENTS = [
+    {
+        "name": "TaskManagerAgent",
+        "module": "task_manager.core.agent",
+        "role": "Main orchestrator — breaks objectives into tasks, runs LangGraph workflow",
+        "entry_point": "TaskManagerAgent(objective).run()",
+    },
+    {
+        "name": "MasterPlanner",
+        "module": "task_manager.core.master_planner",
+        "role": "LLM-driven planner — decomposes tasks, assigns sub-agents, tracks blackboard",
+        "entry_point": "MasterPlanner.plan(state)",
+    },
+    {
+        "name": "TaskRelayAgent",
+        "module": "task_manager.core.task_relay_agent",
+        "role": "Routes completed sub-task results back into the main workflow state",
+        "entry_point": "TaskRelayAgent.relay(state)",
+    },
+]
+
+
+@app.get("/api/agents/detail")
+async def list_agents_detail():
+    """
+    Introspect all real sub-agents and core agents.
+    Returns live metadata including supported_operations loaded from code.
+    """
+    import importlib
+
+    def _collect():
+        sub_agents = []
+        for agent_type, (module_path, class_name, default_op) in _AGENT_REGISTRY.items():
+            entry = {
+                "type": agent_type,
+                "class": class_name,
+                "module": module_path,
+                "default_operation": default_op,
+                "supported_operations": [],
+                "agent_name": agent_type,
+                "status": "ok",
+                "error": None,
+            }
+            try:
+                mod = importlib.import_module(module_path)
+                cls = getattr(mod, class_name)
+                instance = cls()
+                entry["agent_name"] = getattr(instance, "agent_name", class_name)
+                entry["supported_operations"] = getattr(instance, "supported_operations", [])
+            except Exception as exc:
+                entry["status"] = "unavailable"
+                entry["error"] = str(exc)[:200]
+            sub_agents.append(entry)
+        return {"sub_agents": sub_agents, "core_agents": _CORE_AGENTS}
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _collect)
+
+
+@app.post("/api/agents/{agent_type}/run")
+async def run_agent_directly(agent_type: str, data: AgentRunRequest):
+    """
+    Trigger a specific sub-agent directly without a full workflow.
+    Constructs an AgentExecutionRequest and calls execute_task().
+    """
+    import importlib
+
+    if agent_type not in _AGENT_REGISTRY:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown agent type '{agent_type}'. Available: {list(_AGENT_REGISTRY)}",
+        )
+
+    module_path, class_name, default_op = _AGENT_REGISTRY[agent_type]
+    operation = data.operation or default_op
+    task_id = str(uuid.uuid4())
+
+    ai_logger.log_info(
+        f"Direct agent run: type={agent_type} op={operation} objective={data.objective[:120]}",
+        category=LogCategory.EXECUTION,
+        tags=["direct_run", agent_type],
+    )
+
+    def _run():
+        mod = importlib.import_module(module_path)
+        cls = getattr(mod, class_name)
+        instance = cls()
+
+        request = {
+            "task_id": task_id,
+            "task_description": data.objective,
+            "task_type": "atomic",
+            "operation": operation,
+            "parameters": data.parameters,
+            "input_data": data.input_data,
+            "temp_folder": str(Path("./temp_folder").resolve()),
+            "output_folder": str(Path("./output_folder").resolve()),
+            "cache_enabled": True,
+            "blackboard": [],
+            "relevant_entries": [],
+            "max_retries": 1,
+            "timeout_seconds": data.timeout_seconds,
+        }
+
+        return instance.execute_task(request)
+
+    started = datetime.now().isoformat()
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, _run)
+        duration_ms = int((datetime.now().timestamp() - datetime.fromisoformat(started).timestamp()) * 1000)
+        ai_logger.log_execution_event(
+            "agent_direct_run_ok", task_id,
+            task_name=f"{agent_type}/{operation}",
+            details={"objective": data.objective[:200]},
+        )
+        return {
+            "task_id": task_id,
+            "agent_type": agent_type,
+            "operation": operation,
+            "started_at": started,
+            "duration_ms": duration_ms,
+            "result": result,
+        }
+    except Exception as exc:
+        ai_logger.log_error(
+            f"Direct agent run failed: {agent_type}/{operation} — {exc}",
+            exc=exc,
+            category=LogCategory.EXECUTION,
+        )
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 # ============================================================================
