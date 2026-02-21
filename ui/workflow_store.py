@@ -26,6 +26,7 @@ class WorkflowNode:
     y: float = 0.0
     config: Dict[str, Any] = field(default_factory=dict)
     description: str = ""
+    instructions: str = ""  # User-specified task instructions for this node
 
     def to_dict(self) -> dict:
         return asdict(self)

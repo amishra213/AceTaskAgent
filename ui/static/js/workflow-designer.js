@@ -136,6 +136,7 @@ const Designer = {
             y: Math.round(y),
             config: {},
             description: agent ? agent.description || '' : '',
+            instructions: '',  // Task-specific instructions for this node
         };
         this.nodes.push(node);
         this.selectNode(node);
@@ -610,6 +611,16 @@ const Designer = {
                     <span style="font-size:12px;color:var(--text-muted)">x: ${node.x}, y: ${node.y}</span>
                 </div>
             </div>
+            <div class="prop-section">
+                <div class="prop-section-title">Task Instructions</div>
+                <div class="prop-row">
+                    <textarea id="prop-instructions" class="form-input" rows="4"
+                              placeholder="Enter specific instructions for this task...\nE.g.: Search for recent AI trends in healthcare"
+                              onchange="Designer.updateInstructions('${node.id}', this.value)"
+                              style="width:100%;font-size:12px;resize:vertical;min-height:80px;">${App.esc(node.instructions || '')}</textarea>
+                </div>
+                <p style="font-size:10px;color:var(--text-muted);margin-top:4px;">These instructions guide what this task does. Output is automatically passed to connected downstream tasks.</p>
+            </div>
             ${configHTML}
             <div class="prop-section">
                 <button class="btn btn-danger btn-sm delete-node-btn" onclick="Designer.deleteSelected()">
@@ -623,6 +634,11 @@ const Designer = {
     updateLabel(nodeId, label) {
         const node = this.nodes.find(n => n.id === nodeId);
         if (node) { node.label = label; this.render(); }
+    },
+
+    updateInstructions(nodeId, instructions) {
+        const node = this.nodes.find(n => n.id === nodeId);
+        if (node) { node.instructions = instructions; }
     },
 
     updateConfig(nodeId, key, value) {
@@ -879,5 +895,65 @@ const Designer = {
         } catch (e) {
             App.showToast('error', 'Start Failed', e.message);
         }
+    },
+
+    // ---- LangGraph Code Generation ----
+    _generatedCode: '',
+
+    async generateCode() {
+        if (this.nodes.length === 0) {
+            App.showToast('warning', 'Empty Workflow', 'Add nodes before generating code.');
+            return;
+        }
+        if (!this.currentWorkflow) {
+            App.showToast('warning', 'Save First', 'Please save the workflow before generating code.');
+            return;
+        }
+
+        try {
+            const res = await App.api(`/api/workflows/${this.currentWorkflow.id}/generate-code`, {
+                method: 'POST',
+            });
+            this._generatedCode = res.code || '';
+            document.getElementById('generated-code').textContent = this._generatedCode;
+            document.getElementById('code-modal').classList.remove('hidden');
+            lucide.createIcons();
+            App.showToast('success', 'Code Generated', 'LangGraph Python code is ready.');
+        } catch (e) {
+            App.showToast('error', 'Generation Failed', e.message);
+        }
+    },
+
+    closeCodeModal() {
+        document.getElementById('code-modal').classList.add('hidden');
+    },
+
+    copyGeneratedCode() {
+        if (!this._generatedCode) return;
+        navigator.clipboard.writeText(this._generatedCode).then(() => {
+            App.showToast('success', 'Copied', 'Code copied to clipboard.');
+        }).catch(() => {
+            // Fallback
+            const ta = document.createElement('textarea');
+            ta.value = this._generatedCode;
+            document.body.appendChild(ta);
+            ta.select();
+            document.execCommand('copy');
+            document.body.removeChild(ta);
+            App.showToast('success', 'Copied', 'Code copied to clipboard.');
+        });
+    },
+
+    downloadGeneratedCode() {
+        if (!this._generatedCode) return;
+        const name = (this.currentWorkflow?.name || 'workflow').toLowerCase().replace(/\s+/g, '_');
+        const blob = new Blob([this._generatedCode], { type: 'text/x-python' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `${name}_langgraph.py`;
+        a.click();
+        URL.revokeObjectURL(url);
+        App.showToast('info', 'Downloaded', `${name}_langgraph.py saved.`);
     },
 };

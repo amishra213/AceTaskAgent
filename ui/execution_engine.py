@@ -260,15 +260,59 @@ class ExecutionEngine:
 
         return instance
 
+    def _get_predecessors(self, node_id: str, edges: List[dict]) -> List[str]:
+        """Get all predecessor node IDs for a given node."""
+        return [e["source"] for e in edges if e.get("target") == node_id]
+
+    def _collect_upstream_outputs(self, node_id: str, edges: List[dict],
+                                  task_results: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Collect outputs from all predecessor tasks and merge them into
+        a single input_data dict for the current task.
+
+        Structure:
+          {
+            "upstream_results": { "<pred_node_id>": <result>, ... },
+            "merged_text": "<concatenated textual summaries from predecessors>"
+          }
+        """
+        predecessors = self._get_predecessors(node_id, edges)
+        upstream: Dict[str, Any] = {}
+        merged_parts: List[str] = []
+
+        for pred_id in predecessors:
+            result = task_results.get(pred_id)
+            if result is None:
+                continue
+            upstream[pred_id] = result
+
+            # Extract a textual summary to pass forward
+            if isinstance(result, dict):
+                text = (result.get("result_summary")
+                        or result.get("output")
+                        or result.get("summary")
+                        or str(result))
+            else:
+                text = str(result)
+            merged_parts.append(text[:2000])  # cap per-predecessor length
+
+        return {
+            "upstream_results": upstream,
+            "merged_text": "\n---\n".join(merged_parts) if merged_parts else "",
+        }
+
     async def _run_execution(self, instance: ExecutionInstance,
                              nodes: List[dict], edges: List[dict]):
-        """Execute the workflow (simulated with real agent integration hooks)."""
+        """Execute the workflow with real I/O passing between tasks."""
         try:
             instance.status = ExecutionStatus.RUNNING.value
             await self._notify("execution_update", {"execution": instance.to_dict()})
 
             # Build execution order from edges (topological sort)
             exec_order = self._topological_sort(nodes, edges)
+
+            # Track completed task results for I/O passing
+            task_results: Dict[str, Any] = {}
 
             for i, node_id in enumerate(exec_order):
                 task = next((t for t in instance.tasks if t.task_id == node_id), None)
@@ -278,6 +322,9 @@ class ExecutionEngine:
                 if instance.status == ExecutionStatus.CANCELLED.value:
                     break
 
+                # Collect outputs from predecessor tasks
+                input_data = self._collect_upstream_outputs(node_id, edges, task_results)
+
                 # Mark task as running
                 task.status = "running"
                 task.started_at = datetime.now().isoformat()
@@ -286,7 +333,9 @@ class ExecutionEngine:
                 instance.logs.append({
                     "timestamp": datetime.now().isoformat(),
                     "level": "info",
-                    "message": f"Starting task: {task.name} ({task.agent_type})",
+                    "message": f"Starting task: {task.name} ({task.agent_type})"
+                              + (f" — receiving output from {len(input_data['upstream_results'])} predecessor(s)"
+                                 if input_data["upstream_results"] else ""),
                     "task_id": task.task_id,
                 })
 
@@ -298,11 +347,14 @@ class ExecutionEngine:
 
                 # Execute with the real agent or simulate
                 try:
-                    result = await self._execute_task(instance, task, nodes, edges)
+                    result = await self._execute_task(instance, task, nodes, edges, input_data)
                     task.status = "completed"
                     task.completed_at = datetime.now().isoformat()
                     task.progress = 100.0
                     task.result_summary = str(result)[:200] if result else "Completed"
+
+                    # Store result for downstream tasks
+                    task_results[node_id] = result
                     
                     if task.started_at:
                         start = datetime.fromisoformat(task.started_at)
@@ -407,16 +459,29 @@ class ExecutionEngine:
 
     async def _execute_task(self, instance: ExecutionInstance,
                             task: TaskProgress, nodes: List[dict],
-                            edges: List[dict]) -> Any:
+                            edges: List[dict],
+                            input_data: Optional[Dict[str, Any]] = None) -> Any:
         """
         Execute a single task.
 
         1. Attempts to invoke the matching real sub-agent via execute_task().
         2. Falls back to a timed simulation if the sub-agent is unavailable or
            the agent_type is unrecognised.
+
+        Args:
+            input_data: Collected outputs from predecessor tasks (upstream I/O).
         """
         node_config = next((n for n in nodes if n.get("id") == task.task_id), {})
         agent_type = task.agent_type
+        node_instructions = node_config.get("instructions", "")
+
+        # Build task description: combine workflow objective + node-specific instructions
+        task_description = instance.objective
+        if node_instructions:
+            task_description = f"{node_instructions}\n\nWorkflow objective: {instance.objective}"
+
+        # Merge upstream outputs into input_data
+        effective_input = input_data or {}
 
         # ------------------------------------------------------------------ #
         # Try real sub-agent                                                   #
@@ -429,11 +494,11 @@ class ExecutionEngine:
             operation = node_config.get("config", {}).get("operation", default_op) or default_op
             request = {
                 "task_id": task.task_id,
-                "task_description": instance.objective,
+                "task_description": task_description,
                 "task_type": "atomic",
                 "operation": operation,
                 "parameters": node_config.get("config", {}),
-                "input_data": node_config.get("input_data", {}),
+                "input_data": effective_input,
                 "temp_folder": str(Path("./temp_folder").resolve()),
                 "output_folder": str(Path("./output_folder").resolve()),
                 "cache_enabled": True,
@@ -483,8 +548,11 @@ class ExecutionEngine:
         return {
             "agent": agent_type,
             "task": task.name,
+            "instructions": node_instructions,
             "status": "success",
             "output": f"[simulated] Task '{task.name}' completed by {agent_type} agent",
+            "input_received": bool(effective_input.get("upstream_results")),
+            "predecessor_count": len(effective_input.get("upstream_results", {})),
         }
 
     def _topological_sort(self, nodes: List[dict], edges: List[dict]) -> List[str]:

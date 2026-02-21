@@ -1,402 +1,352 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
+
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>AceTaskAgent — Workflow Studio</title>
-    <link rel="stylesheet" href="/static/css/styles.css">
+    <link rel="stylesheet" href="/static/css/styles.css" />
     <!-- Lucide Icons CDN -->
     <script src="https://unpkg.com/lucide@0.344.0/dist/umd/lucide.min.js"></script>
 </head>
+
 <body>
-
-<!-- ===================== SIDEBAR NAV ===================== -->
-<nav id="sidebar">
-    <div class="sidebar-brand">
-        <div class="brand-icon">
-            <svg viewBox="0 0 32 32" width="28" height="28"><circle cx="16" cy="16" r="14" fill="none" stroke="currentColor" stroke-width="2"/><path d="M10 16l4 4 8-8" stroke="currentColor" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        </div>
-        <span class="brand-text">AceTask<span class="accent">Agent</span></span>
-    </div>
-
-    <ul class="nav-links">
-        <li><a href="#" data-page="dashboard" class="nav-link active">
-            <i data-lucide="layout-dashboard"></i><span>Dashboard</span>
-        </a></li>
-        <li><a href="#" data-page="designer" class="nav-link">
-            <i data-lucide="workflow"></i><span>Designer</span>
-        </a></li>
-        <li><a href="#" data-page="executions" class="nav-link">
-            <i data-lucide="play-circle"></i><span>Executions</span>
-        </a></li>
-        <li><a href="#" data-page="monitor" class="nav-link">
-            <i data-lucide="activity"></i><span>Monitor</span>
-        </a></li>
-        <li><a href="#" data-page="alerts" class="nav-link">
-            <i data-lucide="bell"></i><span>Alerts</span>
-            <span id="alert-badge" class="badge hidden">0</span>
-        </a></li>
-    </ul>
-
-    <div class="sidebar-footer">
-        <div class="connection-status" id="ws-status">
-            <span class="status-dot disconnected"></span>
-            <span class="status-text">Disconnected</span>
-        </div>
-    </div>
-</nav>
-
-<!-- ===================== MAIN CONTENT ===================== -->
-<main id="main-content">
-
-    <!-- =========== TOAST CONTAINER =========== -->
-    <div id="toast-container"></div>
-
-    <!-- =========== DASHBOARD PAGE =========== -->
-    <section id="page-dashboard" class="page active">
-        <header class="page-header">
-            <div class="header-left">
-                <h1>Dashboard</h1>
-                <p class="subtitle">Overview of your workflow operations</p>
+    <!-- ===================== SIDEBAR NAV ===================== -->
+    <nav id="sidebar">
+        <div class="sidebar-brand">
+            <div class="brand-icon">
+                <svg viewBox="0 0 32 32" width="28" height="28">
+                    <circle cx="16" cy="16" r="14" fill="none" stroke="currentColor" stroke-width="2" />
+                    <path d="M10 16l4 4 8-8" stroke="currentColor" stroke-width="2.5" fill="none" stroke-linecap="round"
+                        stroke-linejoin="round" />
+                </svg>
             </div>
-            <div class="header-actions">
-                <button id="ai-chat-toggle" onclick="AIChat.toggle()" class="ai-chat-btn" title="AI Assistant">
-                    <i data-lucide="bot"></i>
-                </button>
-            </div>
-        </header>
-
-        <div class="stats-grid">
-            <div class="stat-card">
-                <div class="stat-icon blue"><i data-lucide="workflow"></i></div>
-                <div class="stat-info">
-                    <span class="stat-value" id="stat-workflows">0</span>
-                    <span class="stat-label">Workflows</span>
-                </div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-icon green"><i data-lucide="play-circle"></i></div>
-                <div class="stat-info">
-                    <span class="stat-value" id="stat-running">0</span>
-                    <span class="stat-label">Running</span>
-                </div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-icon purple"><i data-lucide="check-circle-2"></i></div>
-                <div class="stat-info">
-                    <span class="stat-value" id="stat-completed">0</span>
-                    <span class="stat-label">Completed</span>
-                </div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-icon red"><i data-lucide="alert-triangle"></i></div>
-                <div class="stat-info">
-                    <span class="stat-value" id="stat-failed">0</span>
-                    <span class="stat-label">Failed</span>
-                </div>
-            </div>
+            <span class="brand-text">AceTask<span class="accent">Agent</span></span>
         </div>
 
-        <div class="dashboard-grid">
-            <div class="card">
-                <div class="card-header">
-                    <h3>Recent Executions</h3>
-                    <button class="btn btn-sm" onclick="App.navigate('executions')">View All</button>
-                </div>
-                <div class="card-body" id="recent-executions-list">
-                    <div class="empty-state">
-                        <i data-lucide="inbox"></i>
-                        <p>No executions yet</p>
-                    </div>
-                </div>
-            </div>
-            <div class="card">
-                <div class="card-header">
-                    <h3>Recent Alerts</h3>
-                    <button class="btn btn-sm" onclick="App.navigate('alerts')">View All</button>
-                </div>
-                <div class="card-body" id="recent-alerts-list">
-                    <div class="empty-state">
-                        <i data-lucide="bell-off"></i>
-                        <p>No alerts</p>
-                    </div>
-                </div>
+        <ul class="nav-links">
+            <li>
+                <a href="#" data-page="langgraph" class="nav-link active">
+                    <i data-lucide="git-branch"></i><span>LangGraph</span>
+                </a>
+            </li>
+            <li>
+                <a href="#" data-page="alerts" class="nav-link">
+                    <i data-lucide="bell"></i><span>Alerts</span>
+                    <span id="alert-badge" class="badge hidden">0</span>
+                </a>
+            </li>
+        </ul>
+
+        <div class="sidebar-footer">
+            <div class="connection-status" id="ws-status">
+                <span class="status-dot disconnected"></span>
+                <span class="status-text">Disconnected</span>
             </div>
         </div>
+    </nav>
 
-        <div class="card">
-            <div class="card-header">
-                <h3>Activity Timeline</h3>
+    <!-- ===================== MAIN CONTENT ===================== -->
+    <main id="main-content">
+        <!-- =========== TOAST CONTAINER =========== -->
+        <div id="toast-container"></div>
+
+        <!-- =========== ALERTS / LOG VIEWER PAGE =========== -->
+        <section id="page-alerts" class="page">
+            <header class="page-header">
+                <div class="header-left">
+                    <h1>Alerts &amp; Logs</h1>
+                    <p class="subtitle" id="alerts-subtitle">Summarised view of application log messages</p>
+                </div>
+                <div class="header-actions">
+                    <button class="btn btn-outline" onclick="Alerts.refresh()">
+                        <i data-lucide="refresh-cw"></i> Refresh
+                    </button>
+                    <button class="btn btn-outline" onclick="Alerts.toggleAutoRefresh()" id="alerts-autorefresh-btn" title="Auto-refresh every 10 s">
+                        <i data-lucide="timer"></i> <span id="alerts-autorefresh-label">Auto</span>
+                    </button>
+                    <button id="ai-chat-toggle-alerts" onclick="AIChat.toggle()" class="ai-chat-btn" title="AI Assistant">
+                        <i data-lucide="bot"></i>
+                    </button>
+                </div>
+            </header>
+
+            <!-- Summary stat cards -->
+            <div class="log-summary-row" id="log-summary-row">
+                <div class="log-stat-card log-stat-all    active" onclick="Alerts.filter('all')"      data-filter="all">
+                    <span class="log-stat-count" id="log-count-all">—</span>
+                    <span class="log-stat-label">All</span>
+                </div>
+                <div class="log-stat-card log-stat-info"    onclick="Alerts.filter('info')"     data-filter="info">
+                    <span class="log-stat-count" id="log-count-info">—</span>
+                    <span class="log-stat-label">Info</span>
+                </div>
+                <div class="log-stat-card log-stat-warning" onclick="Alerts.filter('warning')"  data-filter="warning">
+                    <span class="log-stat-count" id="log-count-warning">—</span>
+                    <span class="log-stat-label">Warning</span>
+                </div>
+                <div class="log-stat-card log-stat-error"   onclick="Alerts.filter('error')"    data-filter="error">
+                    <span class="log-stat-count" id="log-count-error">—</span>
+                    <span class="log-stat-label">Error</span>
+                </div>
+                <div class="log-stat-card log-stat-critical" onclick="Alerts.filter('critical')" data-filter="critical">
+                    <span class="log-stat-count" id="log-count-critical">—</span>
+                    <span class="log-stat-label">Critical</span>
+                </div>
             </div>
-            <div class="card-body" id="activity-timeline">
+
+            <!-- Toolbar: search + limit -->
+            <div class="alerts-toolbar">
+                <div class="log-search-wrap">
+                    <i data-lucide="search" class="log-search-icon"></i>
+                    <input id="log-search-input" class="log-search-input" type="text"
+                           placeholder="Search messages, categories, sources…"
+                           oninput="Alerts.onSearch(this.value)">
+                </div>
+                <div class="log-limit-wrap">
+                    <label class="log-limit-label">Show</label>
+                    <select class="log-limit-select" id="log-limit-select" onchange="Alerts.onLimitChange(this.value)">
+                        <option value="100">100</option>
+                        <option value="250">250</option>
+                        <option value="500">500</option>
+                        <option value="1000">All</option>
+                    </select>
+                    <label class="log-limit-label">entries</label>
+                </div>
+            </div>
+
+            <!-- Log entries list -->
+            <div id="alerts-list" class="log-entries-list">
                 <div class="empty-state">
-                    <i data-lucide="clock"></i>
-                    <p>Activity will appear here as workflows execute</p>
+                    <i data-lucide="file-text"></i>
+                    <p>Loading log entries…</p>
                 </div>
             </div>
-        </div>
-    </section>
+        </section>
 
-    <!-- =========== WORKFLOW DESIGNER PAGE =========== -->
-    <section id="page-designer" class="page">
-        <header class="page-header">
-            <div class="header-left">
-                <h1>Workflow Designer</h1>
-                <p class="subtitle" id="designer-subtitle">Create and edit agent workflows</p>
-            </div>
-            <div class="header-actions">
-                <button class="btn btn-outline" id="btn-new-workflow" onclick="Designer.newWorkflow()">
-                    <i data-lucide="plus"></i> New
-                </button>
-                <button class="btn btn-outline" id="btn-load-template" onclick="Designer.showTemplates()">
-                    <i data-lucide="layout-template"></i> Templates
-                </button>
-                <button class="btn btn-primary" id="btn-save-workflow" onclick="Designer.saveWorkflow()">
-                    <i data-lucide="save"></i> Save
-                </button>
-                <button class="btn btn-success" id="btn-run-workflow" onclick="Designer.runWorkflow()">
-                    <i data-lucide="play"></i> Run
-                </button>
-                <button id="ai-chat-toggle-designer" onclick="AIChat.toggle()" class="ai-chat-btn" title="AI Assistant">
-                    <i data-lucide="bot"></i>
-                </button>
-            </div>
-        </header>
-
-        <div class="designer-layout">
-            <!-- Agent Palette -->
-            <aside id="agent-palette" class="palette">
-                <h3 class="palette-title">Agents</h3>
-                <div id="agent-list" class="palette-items">
-                    <!-- Populated dynamically -->
+        <!-- =========== LANGGRAPH VIEWER PAGE =========== -->
+        <section id="page-langgraph" class="page active">
+            <header class="page-header">
+                <div class="header-left">
+                    <h1>LangGraph Workflow</h1>
+                    <p class="subtitle" id="lg-subtitle">
+                        Live topology of agents and interactions read from source code
+                    </p>
                 </div>
-            </aside>
-
-            <!-- Canvas Area -->
-            <div class="canvas-wrapper">
-                <div class="canvas-toolbar">
-                    <button class="btn btn-icon" title="Zoom In" onclick="Designer.zoomIn()"><i data-lucide="zoom-in"></i></button>
-                    <button class="btn btn-icon" title="Zoom Out" onclick="Designer.zoomOut()"><i data-lucide="zoom-out"></i></button>
-                    <button class="btn btn-icon" title="Fit" onclick="Designer.zoomFit()"><i data-lucide="maximize-2"></i></button>
-                    <button class="btn btn-icon" title="Clear" onclick="Designer.clearCanvas()"><i data-lucide="trash-2"></i></button>
-                    <span class="toolbar-separator"></span>
-                    <span class="zoom-label" id="zoom-level">100%</span>
+                <div class="header-actions" id="lg-graph-actions">
+                    <button class="btn btn-outline" id="lg-btn-fit" onclick="LangGraphViewer.fit()">
+                        <i data-lucide="maximize-2"></i> Fit
+                    </button>
+                    <button class="btn btn-outline" id="lg-btn-reset" onclick="LangGraphViewer.resetHighlight()">
+                        <i data-lucide="refresh-cw"></i> Reset
+                    </button>
+                    <button class="btn btn-outline" onclick="LangGraphViewer.toggleChains()">
+                        <i data-lucide="link"></i>
+                        <span id="lg-chain-label">Hide Chains</span>
+                    </button>
                 </div>
-                <canvas id="workflow-canvas"></canvas>
+                <div class="header-actions hidden" id="lg-parse-actions">
+                    <label class="btn btn-outline" title="Upload a .py file">
+                        <i data-lucide="upload"></i> Upload .py
+                        <input type="file" id="lg-file-input" accept=".py,.txt" style="display: none"
+                            onchange="LangGraphViewer.loadFile(this)" />
+                    </label>
+                    <button class="btn btn-primary" onclick="LangGraphViewer.parseFromInput()">
+                        <i data-lucide="play"></i> Parse &amp; Visualize
+                    </button>
+                    <button class="btn btn-outline" onclick="LangGraphViewer.clearInput()">
+                        <i data-lucide="x"></i> Clear
+                    </button>
+                </div>
+                <div class="header-actions" id="lg-ai-chat-action">
+                    <button id="ai-chat-toggle-lg" onclick="AIChat.toggle()" class="ai-chat-btn" title="AI Assistant">
+                        <i data-lucide="bot"></i>
+                    </button>
+                </div>
+            </header>
+
+            <!-- Tab strip -->
+            <div class="lg-tab-strip">
+                <button class="lg-tab active" id="lg-tab-live" onclick="LangGraphViewer.switchTab('live')">
+                    <i data-lucide="activity"></i> Live Workflow
+                </button>
+                <button class="lg-tab" id="lg-tab-parse" onclick="LangGraphViewer.switchTab('parse')">
+                    <i data-lucide="code-2"></i> Parse Code
+                </button>
+                <span class="lg-source-badge hidden" id="lg-source-badge">
+                    <i data-lucide="file-code-2"></i>
+                    <span id="lg-source-badge-text">parsed</span>
+                </span>
             </div>
 
-            <!-- Properties Panel -->
-            <aside id="properties-panel" class="properties">
-                <h3 class="palette-title">Properties</h3>
-                <div id="properties-content">
-                    <div class="empty-state small">
-                        <i data-lucide="mouse-pointer-click"></i>
-                        <p>Select a node to edit</p>
+            <!-- ── PARSE CODE PANEL ───────────────────────────────────────────── -->
+            <div id="lg-parse-panel" class="hidden">
+                <div class="lg-parse-container">
+                    <div class="lg-parse-editor-wrap">
+                        <div class="lg-parse-editor-header">
+                            <span class="lg-parse-editor-label">
+                                <i data-lucide="code-2"></i>
+                                Paste LangGraph Python code below
+                            </span>
+                            <span class="lg-parse-hint">
+                                Supported: <code>StateGraph</code> · <code>add_node</code> ·
+                                <code>add_edge</code> · <code>add_conditional_edges</code> ·
+                                <code>set_entry_point</code>
+                            </span>
+                        </div>
+                        <textarea id="lg-code-input" class="lg-parse-textarea" spellcheck="false" autocomplete="off"
+                            autocorrect="off"
+                            placeholder='# Example:&#10;from langgraph.graph import StateGraph, END&#10;&#10;workflow = StateGraph(AgentState)&#10;workflow.add_node("initialize", initialize_handler)&#10;workflow.add_node("process", process_handler)&#10;workflow.set_entry_point("initialize")&#10;workflow.add_edge("initialize", "process")&#10;workflow.add_edge("process", END)'></textarea>
+                    </div>
+                    <div id="lg-parse-status" class="lg-parse-status hidden"></div>
+                    <div class="lg-parse-sample-strip">
+                        <span class="lg-parse-sample-label">Try a sample:</span>
+                        <button class="btn btn-xs btn-outline" onclick="LangGraphViewer.loadSample('simple')">
+                            Simple Pipeline
+                        </button>
+                        <button class="btn btn-xs btn-outline" onclick="LangGraphViewer.loadSample('conditional')">
+                            Conditional Routing
+                        </button>
+                        <button class="btn btn-xs btn-outline" onclick="LangGraphViewer.loadSample('multi')">
+                            Multi-Agent
+                        </button>
+                        <button class="btn btn-xs btn-outline" onclick="LangGraphViewer.loadSample('live')">
+                            This Project's workflow.py
+                        </button>
                     </div>
                 </div>
-            </aside>
-        </div>
+            </div>
 
-        <!-- Workflow List (Side Sheet) -->
-        <div id="workflow-list-overlay" class="overlay hidden">
-            <div class="side-sheet">
-                <div class="side-sheet-header">
-                    <h3 id="side-sheet-title">Workflows</h3>
-                    <button class="btn btn-icon" onclick="Designer.closeOverlay()"><i data-lucide="x"></i></button>
+            <!-- ── GRAPH LAYOUT (shown in both live + after parse) ───────────── -->
+            <div class="lg-layout" id="lg-main-layout">
+                <!-- Legend + controls sidebar -->
+                <aside class="lg-sidebar">
+                    <div class="lg-panel">
+                        <div class="lg-panel-title">Node Categories</div>
+                        <div id="lg-legend-categories"></div>
+                    </div>
+                    <div class="lg-panel">
+                        <div class="lg-panel-title">Edge Types</div>
+                        <div id="lg-legend-edges"></div>
+                    </div>
+                    <div class="lg-panel">
+                        <div class="lg-panel-title">Chain Groups</div>
+                        <div id="lg-legend-chains"></div>
+                    </div>
+                    <div class="lg-panel">
+                        <div class="lg-panel-title">Statistics</div>
+                        <div id="lg-stats" class="lg-stats-grid"></div>
+                    </div>
+                </aside>
+
+                <!-- Graph canvas -->
+                <div class="lg-graph-area">
+                    <div class="lg-toolbar">
+                        <button class="btn btn-icon" title="Zoom In" onclick="LangGraphViewer.zoomIn()">
+                            <i data-lucide="zoom-in"></i>
+                        </button>
+                        <button class="btn btn-icon" title="Zoom Out" onclick="LangGraphViewer.zoomOut()">
+                            <i data-lucide="zoom-out"></i>
+                        </button>
+                        <span class="toolbar-separator"></span>
+                        <span class="lg-zoom-label" id="lg-zoom-level">100%</span>
+                        <span class="toolbar-separator"></span>
+                        <span class="lg-hint">Scroll to zoom · Drag to pan · Click node for details</span>
+                    </div>
+                    <div id="lg-graph-container">
+                        <svg id="lg-svg" xmlns="http://www.w3.org/2000/svg">
+                            <defs>
+                                <marker id="arrow-direct" markerWidth="8" markerHeight="8" refX="7" refY="3"
+                                    orient="auto">
+                                    <path d="M0,0 L0,6 L8,3 z" fill="#6b7280" />
+                                </marker>
+                                <marker id="arrow-conditional" markerWidth="8" markerHeight="8" refX="7" refY="3"
+                                    orient="auto">
+                                    <path d="M0,0 L0,6 L8,3 z" fill="#9ca3af" />
+                                </marker>
+                                <marker id="arrow-chain" markerWidth="9" markerHeight="9" refX="8" refY="3.5"
+                                    orient="auto">
+                                    <path d="M0,0 L0,7 L9,3.5 z" fill="#f97316" />
+                                </marker>
+                                <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+                                    <feGaussianBlur in="SourceGraphic" stdDeviation="4" result="blur" />
+                                    <feMerge>
+                                        <feMergeNode in="blur" />
+                                        <feMergeNode in="SourceGraphic" />
+                                    </feMerge>
+                                </filter>
+                            </defs>
+                            <g id="lg-graph-root"></g>
+                        </svg>
+                    </div>
                 </div>
-                <div class="side-sheet-body" id="side-sheet-body">
-                    <!-- Dynamically populated -->
-                </div>
-            </div>
-        </div>
-    </section>
 
-    <!-- =========== EXECUTIONS PAGE =========== -->
-    <section id="page-executions" class="page">
-        <header class="page-header">
-            <div class="header-left">
-                <h1>Executions</h1>
-                <p class="subtitle">Track and manage workflow runs</p>
-            </div>
-            <div class="header-actions">
-                <button class="btn btn-outline" onclick="Executions.refresh()">
-                    <i data-lucide="refresh-cw"></i> Refresh
-                </button>
-                <button id="ai-chat-toggle-exec" onclick="AIChat.toggle()" class="ai-chat-btn" title="AI Assistant">
-                    <i data-lucide="bot"></i>
-                </button>
-            </div>
-        </header>
-
-        <div class="executions-toolbar">
-            <div class="filter-group">
-                <button class="filter-btn active" data-filter="all">All</button>
-                <button class="filter-btn" data-filter="running">Running</button>
-                <button class="filter-btn" data-filter="completed">Completed</button>
-                <button class="filter-btn" data-filter="failed">Failed</button>
-            </div>
-        </div>
-
-        <div id="executions-list" class="executions-list">
-            <div class="empty-state">
-                <i data-lucide="play-circle"></i>
-                <p>No executions yet. Run a workflow to see results here.</p>
-            </div>
-        </div>
-    </section>
-
-    <!-- =========== MONITOR PAGE =========== -->
-    <section id="page-monitor" class="page">
-        <header class="page-header">
-            <div class="header-left">
-                <h1>Monitor</h1>
-                <p class="subtitle">Real-time execution monitoring</p>
-            </div>
-            <div class="header-actions">
-                <button id="ai-chat-toggle-monitor" onclick="AIChat.toggle()" class="ai-chat-btn" title="AI Assistant">
-                    <i data-lucide="bot"></i>
-                </button>
-            </div>
-        </header>
-
-        <div id="monitor-content">
-            <div class="monitor-grid">
-                <div class="card monitor-card">
-                    <div class="card-header"><h3>Active Tasks</h3></div>
-                    <div class="card-body" id="monitor-active-tasks">
+                <!-- Node detail panel -->
+                <aside class="lg-detail-panel" id="lg-detail-panel">
+                    <div class="lg-panel-title">Node Details</div>
+                    <div id="lg-detail-content">
                         <div class="empty-state small">
-                            <i data-lucide="loader"></i>
-                            <p>No active tasks</p>
+                            <i data-lucide="mouse-pointer-click"></i>
+                            <p>Click a node to inspect it</p>
                         </div>
                     </div>
-                </div>
-                <div class="card monitor-card">
-                    <div class="card-header"><h3>Execution Log</h3></div>
-                    <div class="card-body log-container" id="monitor-log">
-                        <div class="empty-state small">
-                            <i data-lucide="terminal"></i>
-                            <p>Logs will appear here during execution</p>
-                        </div>
-                    </div>
-                </div>
+                </aside>
             </div>
+        </section>
+    </main>
 
-            <div class="card">
-                <div class="card-header"><h3>Task Progress</h3></div>
-                <div class="card-body" id="monitor-progress">
-                    <div class="empty-state small">
-                        <i data-lucide="bar-chart-3"></i>
-                        <p>Progress bars will appear when tasks are running</p>
-                    </div>
+    <!-- =========== AI CHAT PANEL =========== -->
+    <div id="ai-chat-panel">
+        <div class="chat-header">
+            <div class="chat-header-left">
+                <div class="chat-header-icon"><i data-lucide="bot"></i></div>
+                <div>
+                    <div class="chat-header-title">AI Assistant</div>
+                    <div class="chat-header-subtitle">Powered by DeepSeek</div>
                 </div>
             </div>
-        </div>
-    </section>
-
-    <!-- =========== ALERTS PAGE =========== -->
-    <section id="page-alerts" class="page">
-        <header class="page-header">
-            <div class="header-left">
-                <h1>Alerts</h1>
-                <p class="subtitle">System notifications and warnings</p>
-            </div>
-            <div class="header-actions">
-                <button class="btn btn-outline" onclick="Alerts.clearAll()">
-                    <i data-lucide="trash-2"></i> Clear All
+            <div class="chat-header-actions">
+                <button class="btn btn-icon" title="Clear chat" onclick="AIChat.clearHistory()">
+                    <i data-lucide="trash-2"></i>
                 </button>
-                <button id="ai-chat-toggle-alerts" onclick="AIChat.toggle()" class="ai-chat-btn" title="AI Assistant">
-                    <i data-lucide="bot"></i>
+                <button class="btn btn-icon" title="Close" onclick="AIChat.toggle()">
+                    <i data-lucide="x"></i>
                 </button>
             </div>
-        </header>
-
-        <div class="alerts-toolbar">
-            <div class="filter-group">
-                <button class="filter-btn active" data-filter="all" onclick="Alerts.filter('all')">All</button>
-                <button class="filter-btn" data-filter="critical" onclick="Alerts.filter('critical')">Critical</button>
-                <button class="filter-btn" data-filter="error" onclick="Alerts.filter('error')">Errors</button>
-                <button class="filter-btn" data-filter="warning" onclick="Alerts.filter('warning')">Warnings</button>
-                <button class="filter-btn" data-filter="info" onclick="Alerts.filter('info')">Info</button>
+        </div>
+        <div class="chat-context-bar">
+            <span class="context-dot"></span>
+            <i data-lucide="database"></i>
+            <span>Log context enabled &mdash; AI reads recent app logs for smarter
+                answers</span>
+        </div>
+        <div class="chat-messages" id="chat-messages">
+            <div class="chat-msg system">
+                Welcome! I'm the AceTaskAgent AI Assistant. Ask me anything about
+                workflows, agents, troubleshooting, or development.
             </div>
         </div>
-
-        <div id="alerts-list" class="alerts-list">
-            <div class="empty-state">
-                <i data-lucide="bell-off"></i>
-                <p>No alerts at this time</p>
-            </div>
-        </div>
-    </section>
-
-</main>
-
-<!-- =========== AI CHAT PANEL =========== -->
-<div id="ai-chat-panel">
-    <div class="chat-header">
-        <div class="chat-header-left">
-            <div class="chat-header-icon"><i data-lucide="bot"></i></div>
-            <div>
-                <div class="chat-header-title">AI Assistant</div>
-                <div class="chat-header-subtitle">Powered by DeepSeek</div>
-            </div>
-        </div>
-        <div class="chat-header-actions">
-            <button class="btn btn-icon" title="Clear chat" onclick="AIChat.clearHistory()"><i data-lucide="trash-2"></i></button>
-            <button class="btn btn-icon" title="Close" onclick="AIChat.toggle()"><i data-lucide="x"></i></button>
-        </div>
-    </div>
-    <div class="chat-context-bar">
-        <span class="context-dot"></span>
-        <i data-lucide="database"></i>
-        <span>Log context enabled &mdash; AI reads recent app logs for smarter answers</span>
-    </div>
-    <div class="chat-messages" id="chat-messages">
-        <div class="chat-msg system">
-            Welcome! I'm the AceTaskAgent AI Assistant. Ask me anything about workflows, agents, troubleshooting, or development.
-        </div>
-    </div>
-    <div class="chat-input-area">
-        <textarea id="chat-input" placeholder="Ask about workflows, troubleshooting…" rows="1"
-                  onkeydown="AIChat.handleKey(event)"></textarea>
-        <button class="chat-send-btn" id="chat-send-btn" onclick="AIChat.send()" title="Send">
-            <i data-lucide="send"></i>
-        </button>
-    </div>
-</div>
-
-<!-- =========== RUN WORKFLOW MODAL =========== -->
-<div id="run-modal" class="modal-overlay hidden">
-    <div class="modal">
-        <div class="modal-header">
-            <h3>Run Workflow</h3>
-            <button class="btn btn-icon" onclick="Designer.closeRunModal()"><i data-lucide="x"></i></button>
-        </div>
-        <div class="modal-body">
-            <label class="form-label">Objective / Task Description</label>
-            <textarea id="run-objective" class="form-input" rows="4" placeholder="Describe what you want this workflow to accomplish..."></textarea>
-        </div>
-        <div class="modal-footer">
-            <button class="btn btn-outline" onclick="Designer.closeRunModal()">Cancel</button>
-            <button class="btn btn-success" onclick="Designer.executeWorkflow()">
-                <i data-lucide="play"></i> Start Execution
+        <div class="chat-input-area">
+            <textarea id="chat-input" placeholder="Ask about workflows, troubleshooting…" rows="1"
+                onkeydown="AIChat.handleKey(event)"></textarea>
+            <button class="chat-send-btn" id="chat-send-btn" onclick="AIChat.send()" title="Send">
+                <i data-lucide="send"></i>
             </button>
         </div>
     </div>
-</div>
 
-<!-- =========== SCRIPTS =========== -->
-<script src="/static/js/app.js"></script>
-<script src="/static/js/workflow-designer.js"></script>
-<script src="/static/js/executions.js"></script>
-<script src="/static/js/monitor.js"></script>
-<script src="/static/js/alerts.js"></script>
-<script src="/static/js/aichat.js"></script>
-<script>
-    // Initialize
-    document.addEventListener('DOMContentLoaded', () => {
-        lucide.createIcons();
-        App.init();
-    });
-</script>
+    <!-- =========== SCRIPTS =========== -->
+    <script src="/static/js/app.js"></script>
+    <script src="/static/js/alerts.js"></script>
+    <script src="/static/js/aichat.js"></script>
+    <script src="/static/js/langgraph-viewer.js"></script>
+    <script>
+        // Initialize
+        document.addEventListener("DOMContentLoaded", () => {
+            lucide.createIcons();
+            App.init();
+        });
+    </script>
 </body>
+
 </html>
