@@ -1375,13 +1375,15 @@ async def parse_langgraph_code(data: LangGraphParseRequest):
       - StateGraph(State) construction
       - workflow.add_node("name", fn)
       - workflow.set_entry_point("name")
-      - workflow.add_edge("src", "dst")          — direct edges
-      - workflow.add_edge("src", END)             — terminal edges
-      - workflow.add_conditional_edges(           — conditional fan-out
-        "src", router_fn, {"key": "dst", ...})
-      - graph.compile(...)                        — recognised but not rendered
+      - workflow.add_edge("src", "dst")                    — direct edges
+      - workflow.add_edge("src", END)                      — terminal edges
+      - workflow.add_conditional_edges(                    — conditional fan-out
+            "src", router_fn, {"key": "dst", ...})
+      - Inline lambda router:  lambda s: "a" if … else "b"
+      - Router function bodies: if/elif/else → condition labels on each branch
+      - Synthetic DECISION nodes inserted for every conditional split
+      - graph.compile(...)                                 — recognised but not rendered
       - Multiple graph variable names (workflow / graph / app / builder / sg)
-      - Comments parsed for routing hints
     """
     code = data.code.strip()
     if not code:
@@ -1464,7 +1466,6 @@ async def parse_langgraph_code(data: LangGraphParseRequest):
 
     # Detect all variable names assigned a StateGraph instance
     graph_vars: set[str] = set()
-    # Also detect variable names returned from build_workflow / compile-style calls
     _GRAPH_CONSTRUCTORS = {"StateGraph", "MessageGraph", "Graph"}
 
     class _GraphVarFinder(ast.NodeVisitor):
@@ -1487,7 +1488,6 @@ async def parse_langgraph_code(data: LangGraphParseRequest):
     # Fallback: common names used for StateGraph variables
     _FALLBACK_VAR_NAMES = {"workflow", "graph", "app", "builder", "sg", "wf", "g"}
     if not graph_vars:
-        # Try to detect via method calls like workflow.add_node(...)
         for node in ast.walk(tree):
             if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
                 call = node.value
@@ -1500,22 +1500,123 @@ async def parse_langgraph_code(data: LangGraphParseRequest):
         if not graph_vars:
             graph_vars = _FALLBACK_VAR_NAMES
 
+    # ── Collect all top-level function definitions for router analysis ────
+    # Maps function name → list of (condition_str, return_value) tuples
+    router_functions: Dict[str, Dict[str, Any]] = {}
+
+    def _extract_router_branches(fn_node: ast.FunctionDef) -> Dict[str, Any]:
+        """
+        Walk a router function body and extract if/elif/else branch conditions
+        mapped to their return values. Returns:
+          {
+            "branches": [{"condition": str, "returns": str}, ...],
+            "default_return": str | None,
+            "source": str  (unparsed body snippet)
+          }
+        """
+        branches = []
+        default_ret = None
+
+        def _returns_in(stmts) -> Optional[str]:
+            """Find the first Return value string inside a statement list."""
+            for s in stmts:
+                if isinstance(s, ast.Return):
+                    if s.value is not None:
+                        try:
+                            return ast.unparse(s.value).strip("\"'")
+                        except Exception:
+                            return None
+                # recurse one level for nested ifs
+                elif isinstance(s, ast.If):
+                    ret = _returns_in(s.body)
+                    if ret:
+                        return ret
+            return None
+
+        for stmt in fn_node.body:
+            if isinstance(stmt, ast.If):
+                _walk_if_chain(stmt, branches)
+            elif isinstance(stmt, ast.Return) and stmt.value is not None:
+                # Bare return at function root = default / unconditional
+                try:
+                    default_ret = ast.unparse(stmt.value).strip("\"'")
+                except Exception:
+                    pass
+
+        # If no branches but there's a default return, record it
+        if not branches and default_ret:
+            branches.append({"condition": "default", "returns": default_ret})
+
+        try:
+            source_snippet = ast.unparse(fn_node)[:300]
+        except Exception:
+            source_snippet = ""
+
+        return {
+            "branches": branches,
+            "default_return": default_ret,
+            "source": source_snippet,
+        }
+
+    def _walk_if_chain(if_node: ast.If, branches: list) -> None:
+        """Recursively walk if / elif / else chain and append branch dicts."""
+        try:
+            cond_str = ast.unparse(if_node.test)
+        except Exception:
+            cond_str = "<condition>"
+
+        # Shorten long condition strings
+        if len(cond_str) > 60:
+            cond_str = cond_str[:57] + "…"
+
+        # Find return value inside this branch body
+        ret = None
+        for s in if_node.body:
+            if isinstance(s, ast.Return) and s.value is not None:
+                try:
+                    ret = ast.unparse(s.value).strip("\"'")
+                except Exception:
+                    ret = None
+                break
+
+        if ret:
+            branches.append({"condition": cond_str, "returns": ret})
+
+        # Handle elif (orelse is a single If node) and else (orelse is a list)
+        if if_node.orelse:
+            if len(if_node.orelse) == 1 and isinstance(if_node.orelse[0], ast.If):
+                _walk_if_chain(if_node.orelse[0], branches)
+            else:
+                # else branch
+                else_ret = None
+                for s in if_node.orelse:
+                    if isinstance(s, ast.Return) and s.value is not None:
+                        try:
+                            else_ret = ast.unparse(s.value).strip("\"'")
+                        except Exception:
+                            pass
+                        break
+                if else_ret:
+                    branches.append({"condition": "else", "returns": else_ret})
+
+    for fn in ast.walk(tree):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            router_functions[fn.name] = _extract_router_branches(fn)  # type: ignore[arg-type]
+
     # ── Collect all method calls on graph vars ────────────────────────────
-    raw_nodes: Dict[str, Dict[str, Any]] = {}   # id → metadata
+    raw_nodes: Dict[str, Dict[str, Any]] = {}
     raw_edges: list[Dict[str, Any]] = []
     entry_point: str = ""
     end_aliases: set[str] = {"END", "__end__", "end"}
 
     def _str_val(node) -> str:
-        """Extract a string constant from an AST node, or '' if not possible."""
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             return node.value
         if isinstance(node, ast.Name):
-            return node.id  # handles END reference
+            return node.id
         return ""
 
     def _get_dict_mapping(node) -> Dict[str, str]:
-        """Extract {key: value} from an ast.Dict where all keys/values are strings/Names."""
         result = {}
         if not isinstance(node, ast.Dict):
             return result
@@ -1542,6 +1643,10 @@ async def parse_langgraph_code(data: LangGraphParseRequest):
                 "color": _AGENT_COLORS.get(name, _color_for(name)),
                 "description": f"Node: {name}",
             }
+
+    # ── Pending conditional edges — resolved after all nodes collected ────
+    # Each entry: (src_node_id, router_name, branch_map, lambda_body)
+    pending_conditionals: list[tuple] = []
 
     for stmt in ast.walk(tree):
         if not (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)):
@@ -1604,81 +1709,137 @@ async def parse_langgraph_code(data: LangGraphParseRequest):
 
         # ── add_conditional_edges("src", router, {"key":"dst", ...}) ──────
         elif method == "add_conditional_edges":
-            if len(args) >= 1:
-                src = _str_val(args[0])
-                if not src:
-                    continue
-                _ensure_node(src)
+            if not args:
+                continue
+            src = _str_val(args[0])
+            if not src:
+                continue
+            _ensure_node(src)
 
-                # Router function name (for label hint)
-                router_name = ""
-                if len(args) >= 2:
-                    r = args[1]
-                    if isinstance(r, ast.Name):
-                        router_name = r.id
-                    elif isinstance(r, ast.Attribute):
-                        router_name = r.attr
-                    elif isinstance(r, ast.Lambda):
-                        # Try to infer condition from lambda body
-                        try:
-                            router_name = f"λ: {ast.unparse(r.body)[:60]}"
-                        except Exception:
-                            router_name = "<lambda>"
+            # Router function name / lambda body
+            router_name = ""
+            lambda_body = ""
+            if len(args) >= 2:
+                r = args[1]
+                if isinstance(r, ast.Name):
+                    router_name = r.id
+                elif isinstance(r, ast.Attribute):
+                    router_name = r.attr
+                elif isinstance(r, ast.Lambda):
+                    try:
+                        lambda_body = ast.unparse(r.body)[:80]
+                        router_name = f"λ: {lambda_body}"
+                    except Exception:
+                        router_name = "<lambda>"
 
-                # Branch mapping dict
-                branch_map: Dict[str, str] = {}
-                if len(args) >= 3:
-                    branch_map = _get_dict_mapping(args[2])
-                elif "path_map" in kwargs:
-                    branch_map = _get_dict_mapping(kwargs["path_map"])
+            # Branch mapping dict
+            branch_map: Dict[str, str] = {}
+            if len(args) >= 3:
+                branch_map = _get_dict_mapping(args[2])
+            elif "path_map" in kwargs:
+                branch_map = _get_dict_mapping(kwargs["path_map"])
 
-                if branch_map:
-                    for cond_key, dst in branch_map.items():
-                        is_end = dst in end_aliases
-                        real_dst = "__end__" if is_end else dst
-                        _ensure_node(real_dst)
-                        # Derive edge label: prefer cond_key over router_name
-                        label = cond_key if cond_key not in end_aliases else "complete"
-                        raw_edges.append({
-                            "id": _new_edge_id(),
-                            "source": src,
-                            "target": real_dst,
-                            "type": "conditional",
-                            "label": label,
-                            "router": router_name,
-                        })
-                else:
-                    # No branch map — emit a single conditional edge with label = router
-                    raw_edges.append({
-                        "id": _new_edge_id(),
-                        "source": src,
-                        "target": "__unknown__",
-                        "type": "conditional",
-                        "label": router_name or "conditional",
-                        "router": router_name,
-                    })
-                    _ensure_node("__unknown__")
+            pending_conditionals.append((src, router_name, branch_map, lambda_body))
 
-    # ── Detect lambda-based conditional edges added via add_conditional_edges
-    #    with inline lambda (PDF→OCR pattern):
-    #      workflow.add_conditional_edges("pdf", lambda s: "ocr" if … else "agg", {…})
-    # Already handled above via ast.Lambda router_name extraction.
+    # ── Resolve conditional edges — insert decision nodes ─────────────────
+    # For each add_conditional_edges call we insert a synthetic DECISION node
+    # between the source and all its conditional targets so the diagram shows
+    # a clear fork point (diamond shape in the frontend).
+    decision_nodes_created: Dict[str, str] = {}   # src → decision_node_id
+
+    for src, router_name, branch_map, lambda_body in pending_conditionals:
+        # Create a unique decision node id for this source
+        decision_id = f"__decision__{src}"
+        if decision_id not in raw_nodes:
+            short_router = router_name.split("(")[0].strip()
+            if short_router.startswith("λ:"):
+                short_router = "λ condition"
+            display_label = short_router if short_router else "Route"
+            # Build condition summary from router function body if available
+            condition_info = router_functions.get(router_name, {})
+            branches_desc = ""
+            if condition_info and condition_info.get("branches"):
+                branches_desc = "; ".join(
+                    f"{b['condition']} → {b['returns']}"
+                    for b in condition_info["branches"][:6]
+                )
+            elif lambda_body:
+                branches_desc = lambda_body
+
+            raw_nodes[decision_id] = {
+                "id": decision_id,
+                "label": display_label[:18] if display_label else "Route",
+                "category": "condition",
+                "color": "#f59e0b",
+                "description": (
+                    f"Router: {router_name or 'conditional'}"
+                    + (f"\n{branches_desc}" if branches_desc else "")
+                ),
+                "router_name": router_name,
+                "router_branches": condition_info.get("branches", []) if condition_info else [],
+                "lambda_body": lambda_body,
+            }
+
+        decision_nodes_created[src] = decision_id
+
+        # Edge from source → decision node (direct)
+        raw_edges.append({
+            "id": _new_edge_id(),
+            "source": src,
+            "target": decision_id,
+            "type": "direct",
+            "label": "",
+        })
+
+        if branch_map:
+            # Enrich branch labels with condition text from router function body
+            router_info = router_functions.get(router_name, {})
+            branch_conditions: Dict[str, str] = {}
+            if router_info and router_info.get("branches"):
+                for b in router_info["branches"]:
+                    ret = b.get("returns", "")
+                    cond = b.get("condition", "")
+                    if ret and ret in branch_map.values():
+                        # Map destination name → condition string
+                        branch_conditions[ret] = cond
+
+            for cond_key, dst in branch_map.items():
+                is_end = dst in end_aliases
+                real_dst = "__end__" if is_end else dst
+                _ensure_node(real_dst)
+
+                # Build the best possible label:
+                # 1. condition expression from router body  2. branch map key
+                label = cond_key if cond_key not in end_aliases else "complete"
+                condition_text = branch_conditions.get(real_dst, "")
+                raw_edges.append({
+                    "id": _new_edge_id(),
+                    "source": decision_id,
+                    "target": real_dst,
+                    "type": "conditional",
+                    "label": label,
+                    "condition": condition_text,
+                    "router": router_name,
+                })
+        else:
+            # No branch map — single conditional edge with condition label
+            raw_edges.append({
+                "id": _new_edge_id(),
+                "source": decision_id,
+                "target": "__unknown__",
+                "type": "conditional",
+                "label": router_name or "conditional",
+                "condition": "",
+                "router": router_name,
+            })
+            _ensure_node("__unknown__")
 
     # ── If no nodes found at all, try regex fallback ──────────────────────
     if not raw_nodes:
-        # Fallback: regex scan for common patterns
-        _re_add_node = re.compile(
-            r'\.add_node\(\s*["\'](\w+)["\']'
-        )
-        _re_add_edge = re.compile(
-            r'\.add_edge\(\s*["\'](\w+)["\']\s*,\s*["\']?(\w+)["\']?'
-        )
-        _re_entry = re.compile(
-            r'\.set_entry_point\(\s*["\'](\w+)["\']'
-        )
-        _re_cond = re.compile(
-            r'\.add_conditional_edges\(\s*["\'](\w+)["\']\s*,\s*[^,]+,\s*\{([^}]+)\}'
-        )
+        _re_add_node = re.compile(r'\.add_node\(\s*["\'](\w+)["\']')
+        _re_add_edge = re.compile(r'\.add_edge\(\s*["\'](\w+)["\']\s*,\s*["\']?(\w+)["\']?')
+        _re_entry    = re.compile(r'\.set_entry_point\(\s*["\'](\w+)["\']')
+        _re_cond     = re.compile(r'\.add_conditional_edges\(\s*["\'](\w+)["\']\s*,\s*[^,]+,\s*\{([^}]+)\}')
         for m in _re_add_node.finditer(code):
             _ensure_node(m.group(1))
         for m in _re_add_edge.finditer(code):
@@ -1694,14 +1855,22 @@ async def parse_langgraph_code(data: LangGraphParseRequest):
         for m in _re_cond.finditer(code):
             src = m.group(1)
             _ensure_node(src)
-            # parse key: value pairs inside the brace body
+            decision_id = f"__decision__{src}"
+            if decision_id not in raw_nodes:
+                raw_nodes[decision_id] = {
+                    "id": decision_id, "label": "Route",
+                    "category": "condition", "color": "#f59e0b",
+                    "description": f"Conditional routing from {src}",
+                    "router_name": "", "router_branches": [], "lambda_body": "",
+                }
+            raw_edges.append({"id": _new_edge_id(), "source": src, "target": decision_id, "type": "direct", "label": ""})
             for pair in re.finditer(r'["\'](\w+)["\']\s*:\s*["\']?(\w+)["\']?', m.group(2)):
                 k, v = pair.group(1), pair.group(2)
                 real_dst = "__end__" if v in end_aliases else v
                 _ensure_node(real_dst)
                 raw_edges.append({
-                    "id": _new_edge_id(), "source": src, "target": real_dst,
-                    "type": "conditional", "label": k,
+                    "id": _new_edge_id(), "source": decision_id, "target": real_dst,
+                    "type": "conditional", "label": k, "condition": "", "router": "",
                 })
 
     if not raw_nodes:
@@ -1723,19 +1892,17 @@ async def parse_langgraph_code(data: LangGraphParseRequest):
     # ── Auto-detect entry point if not found via set_entry_point ─────────
     if not entry_point:
         all_targets = {e["target"] for e in raw_edges}
-        candidates = [nid for nid in raw_nodes if nid not in all_targets and nid != "__end__"]
+        candidates = [nid for nid in raw_nodes if nid not in all_targets and nid != "__end__"
+                      and not nid.startswith("__decision__")]
         if candidates:
-            # Prefer obvious entry names
-            for c in ("initialize", "init", "start"):
+            for c in ("initialize", "init", "start", "intake"):
                 if c in candidates:
                     entry_point = c
                     break
             if not entry_point:
                 entry_point = candidates[0]
 
-    # ── Assign layers ────────────────────────────────────────────────────
-    #  Use BFS from entry_point to compute topological depth
-
+    # ── Assign layers (BFS from entry point) ─────────────────────────────
     adj: Dict[str, list] = defaultdict(list)
     for e in raw_edges:
         adj[e["source"]].append(e["target"])
@@ -1753,15 +1920,11 @@ async def parse_langgraph_code(data: LangGraphParseRequest):
                     queue.append((nxt, d + 1))
 
     for nid, nm in raw_nodes.items():
-        # 1. Use _LAYER_HINTS if available
-        # 2. Fall back to BFS depth
-        # 3. Default to middle layer (5)
         layer = _LAYER_HINTS.get(nid, depth.get(nid, 5))
         nm["layer"] = layer  # type: ignore[assignment]
 
-    # ── Infer chain groups from consecutive conditional/lambda edges ──────
+    # ── Infer chain groups ────────────────────────────────────────────────
     chain_groups: list[Dict[str, Any]] = []
-    # Look for pairs where src→dst are both sub-agents connected by a chain-like label
     _chain_keywords = ("image", "ocr", "csv", "excel", "table", "chart", "chain", "found", "created")
     seen_chains: set[str] = set()
     for e in raw_edges:
@@ -1783,14 +1946,13 @@ async def parse_langgraph_code(data: LangGraphParseRequest):
 
     # ── Build final response ──────────────────────────────────────────────
     node_list = list(raw_nodes.values())
-
-    # Collect all unique categories present
     present_categories = {n["category"] for n in node_list}
     cat_defs = {
         "core":      {"label": "Core Orchestration",   "color": "#6366f1"},
         "subagent":  {"label": "Sub-Agent Execution",  "color": "#64748b"},
         "synthesis": {"label": "Synthesis / Debate",   "color": "#0ea5e9"},
         "control":   {"label": "Control Flow",         "color": "#f59e0b"},
+        "condition": {"label": "Condition / Router",   "color": "#f59e0b"},
         "terminal":  {"label": "Terminal",             "color": "#374151"},
         "task":      {"label": "Task Node",            "color": "#6b7280"},
     }
@@ -1801,6 +1963,8 @@ async def parse_langgraph_code(data: LangGraphParseRequest):
         "entry_point": entry_point,
         "graph_vars": list(graph_vars),
         "filename": data.filename or "(pasted code)",
+        "decision_nodes": len(decision_nodes_created),
+        "router_functions": list(router_functions.keys()),
     }
 
     return {
@@ -1814,7 +1978,7 @@ async def parse_langgraph_code(data: LangGraphParseRequest):
         "categories": {k: v for k, v in cat_defs.items() if k in present_categories},
         "edge_types": {
             "direct":      {"label": "Direct edge",         "style": "solid",  "color": "#6b7280"},
-            "conditional": {"label": "Conditional routing", "style": "dashed", "color": "#9ca3af"},
+            "conditional": {"label": "Conditional branch",  "style": "dashed", "color": "#f59e0b"},
             "chain":       {"label": "Chain execution",     "style": "chain",  "color": "#f97316"},
         },
     }

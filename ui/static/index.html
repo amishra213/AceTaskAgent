@@ -133,6 +133,7 @@
                         Live topology of agents and interactions read from source code
                     </p>
                 </div>
+                <!-- Graph view actions (always visible) -->
                 <div class="header-actions" id="lg-graph-actions">
                     <button class="btn btn-outline" id="lg-btn-fit" onclick="LangGraphViewer.fit()">
                         <i data-lucide="maximize-2"></i> Fit
@@ -144,18 +145,17 @@
                         <i data-lucide="link"></i>
                         <span id="lg-chain-label">Hide Chains</span>
                     </button>
-                </div>
-                <div class="header-actions hidden" id="lg-parse-actions">
-                    <label class="btn btn-outline" title="Upload a .py file">
-                        <i data-lucide="upload"></i> Upload .py
-                        <input type="file" id="lg-file-input" accept=".py,.txt" style="display: none"
-                            onchange="LangGraphViewer.loadFile(this)" />
-                    </label>
-                    <button class="btn btn-primary" onclick="LangGraphViewer.parseFromInput()">
-                        <i data-lucide="play"></i> Parse &amp; Visualize
+                    <span class="header-separator"></span>
+                    <!-- Code input toggle -->
+                    <button class="btn btn-outline" id="lg-btn-code-toggle"
+                            onclick="LangGraphViewer.toggleCodeDrawer()"
+                            title="Paste or upload custom LangGraph code">
+                        <i data-lucide="code-2"></i> Load Code
                     </button>
-                    <button class="btn btn-outline" onclick="LangGraphViewer.clearInput()">
-                        <i data-lucide="x"></i> Clear
+                    <button class="btn btn-outline hidden" id="lg-btn-reload-live"
+                            onclick="LangGraphViewer.reloadLive()"
+                            title="Discard custom code and reload live workflow">
+                        <i data-lucide="refresh-cw"></i> Live
                     </button>
                 </div>
                 <div class="header-actions" id="lg-ai-chat-action">
@@ -165,13 +165,60 @@
                 </div>
             </header>
 
-            <!-- Tab strip -->
+            <!-- ── COLLAPSIBLE CODE INPUT DRAWER ──────────────────────────────── -->
+            <div id="lg-code-drawer" class="lg-code-drawer hidden">
+                <div class="lg-code-drawer-inner">
+                    <div class="lg-code-drawer-header">
+                        <span class="lg-code-drawer-label">
+                            <i data-lucide="code-2"></i>
+                            Paste or upload any LangGraph Python code
+                        </span>
+                        <span class="lg-parse-hint">
+                            Supports: <code>StateGraph</code> · <code>add_node</code> ·
+                            <code>add_edge</code> · <code>add_conditional_edges</code> ·
+                            <code>set_entry_point</code>
+                        </span>
+                        <button class="btn btn-icon lg-drawer-close"
+                                onclick="LangGraphViewer.toggleCodeDrawer()" title="Close">
+                            <i data-lucide="x"></i>
+                        </button>
+                    </div>
+                    <textarea id="lg-code-input" class="lg-parse-textarea" spellcheck="false"
+                        autocomplete="off" autocorrect="off"
+                        placeholder='# Example:&#10;from langgraph.graph import StateGraph, END&#10;&#10;workflow = StateGraph(AgentState)&#10;workflow.add_node("initialize", initialize_handler)&#10;workflow.add_node("process", process_handler)&#10;workflow.set_entry_point("initialize")&#10;workflow.add_edge("initialize", "process")&#10;workflow.add_edge("process", END)'></textarea>
+                    <div class="lg-code-drawer-footer">
+                        <div class="lg-parse-sample-strip">
+                            <span class="lg-parse-sample-label">Samples:</span>
+                            <button class="btn btn-xs btn-outline" onclick="LangGraphViewer.loadSample('simple')">Simple Pipeline</button>
+                            <button class="btn btn-xs btn-outline" onclick="LangGraphViewer.loadSample('conditional')">Conditional Routing</button>
+                            <button class="btn btn-xs btn-outline" onclick="LangGraphViewer.loadSample('multi')">Multi-Agent</button>
+                            <button class="btn btn-xs btn-outline" onclick="LangGraphViewer.loadSample('live')">This Project</button>
+                        </div>
+                        <div class="lg-code-drawer-actions">
+                            <label class="btn btn-outline" title="Upload a .py file">
+                                <i data-lucide="upload"></i> Upload .py
+                                <input type="file" id="lg-file-input" accept=".py,.txt" style="display:none"
+                                    onchange="LangGraphViewer.loadFile(this)" />
+                            </label>
+                            <button class="btn btn-outline" onclick="LangGraphViewer.clearInput()">
+                                <i data-lucide="x"></i> Clear
+                            </button>
+                            <button class="btn btn-primary" onclick="LangGraphViewer.parseFromInput()">
+                                <i data-lucide="play"></i> Parse &amp; Visualize
+                            </button>
+                        </div>
+                    </div>
+                    <div id="lg-parse-status" class="lg-parse-status hidden"></div>
+                </div>
+            </div>
+
+            <!-- Tab strip (secondary result tabs, shown after parse) -->
             <div class="lg-tab-strip">
-                <button class="lg-tab active" id="lg-tab-live" onclick="LangGraphViewer.switchTab('live')">
-                    <i data-lucide="activity"></i> Live Workflow
+                <button class="lg-tab active" id="lg-tab-workflow" onclick="LangGraphViewer.switchTab('workflow')">
+                    <i data-lucide="git-branch"></i> Workflow
                 </button>
-                <button class="lg-tab" id="lg-tab-parse" onclick="LangGraphViewer.switchTab('parse')">
-                    <i data-lucide="code-2"></i> Parse Code
+                <button class="lg-tab hidden" id="lg-tab-summary" onclick="LangGraphViewer.switchTab('summary')">
+                    <i data-lucide="layout-list"></i> Code Summary
                 </button>
                 <span class="lg-source-badge hidden" id="lg-source-badge">
                     <i data-lucide="file-code-2"></i>
@@ -179,45 +226,43 @@
                 </span>
             </div>
 
-            <!-- ── PARSE CODE PANEL ───────────────────────────────────────────── -->
-            <div id="lg-parse-panel" class="hidden">
-                <div class="lg-parse-container">
-                    <div class="lg-parse-editor-wrap">
-                        <div class="lg-parse-editor-header">
-                            <span class="lg-parse-editor-label">
-                                <i data-lucide="code-2"></i>
-                                Paste LangGraph Python code below
-                            </span>
-                            <span class="lg-parse-hint">
-                                Supported: <code>StateGraph</code> · <code>add_node</code> ·
-                                <code>add_edge</code> · <code>add_conditional_edges</code> ·
-                                <code>set_entry_point</code>
-                            </span>
+            <!-- ── CODE SUMMARY PANEL ─────────────────────────────────────────── -->
+            <div id="lg-summary-panel" class="lg-summary-panel hidden">
+                <div class="lg-summary-toolbar">
+                    <button class="btn btn-outline" onclick="LangGraphViewer.switchTab('workflow')">
+                        <i data-lucide="arrow-left"></i> Workflow
+                    </button>
+                    <span class="lg-summary-title" id="lg-summary-filename"></span>
+                </div>
+
+                <!-- Stats bar -->
+                <div class="lg-summary-stats-bar" id="lg-summary-stats"></div>
+
+                <!-- Two-column content: agents/nodes left, edges/routing right -->
+                <div class="lg-summary-body">
+                    <!-- Agents & Sub-agents -->
+                    <section class="lg-summary-section">
+                        <div class="lg-summary-section-header">
+                            <i data-lucide="cpu"></i>
+                            <span>Agents &amp; Sub-agents</span>
+                            <span class="lg-summary-count" id="lg-summary-node-count"></span>
                         </div>
-                        <textarea id="lg-code-input" class="lg-parse-textarea" spellcheck="false" autocomplete="off"
-                            autocorrect="off"
-                            placeholder='# Example:&#10;from langgraph.graph import StateGraph, END&#10;&#10;workflow = StateGraph(AgentState)&#10;workflow.add_node("initialize", initialize_handler)&#10;workflow.add_node("process", process_handler)&#10;workflow.set_entry_point("initialize")&#10;workflow.add_edge("initialize", "process")&#10;workflow.add_edge("process", END)'></textarea>
-                    </div>
-                    <div id="lg-parse-status" class="lg-parse-status hidden"></div>
-                    <div class="lg-parse-sample-strip">
-                        <span class="lg-parse-sample-label">Try a sample:</span>
-                        <button class="btn btn-xs btn-outline" onclick="LangGraphViewer.loadSample('simple')">
-                            Simple Pipeline
-                        </button>
-                        <button class="btn btn-xs btn-outline" onclick="LangGraphViewer.loadSample('conditional')">
-                            Conditional Routing
-                        </button>
-                        <button class="btn btn-xs btn-outline" onclick="LangGraphViewer.loadSample('multi')">
-                            Multi-Agent
-                        </button>
-                        <button class="btn btn-xs btn-outline" onclick="LangGraphViewer.loadSample('live')">
-                            This Project's workflow.py
-                        </button>
-                    </div>
+                        <div id="lg-summary-nodes" class="lg-summary-nodes"></div>
+                    </section>
+
+                    <!-- Edge &amp; Routing Summary -->
+                    <section class="lg-summary-section">
+                        <div class="lg-summary-section-header">
+                            <i data-lucide="git-merge"></i>
+                            <span>Edges &amp; Routing</span>
+                            <span class="lg-summary-count" id="lg-summary-edge-count"></span>
+                        </div>
+                        <div id="lg-summary-edges" class="lg-summary-edges"></div>
+                    </section>
                 </div>
             </div>
 
-            <!-- ── GRAPH LAYOUT (shown in both live + after parse) ───────────── -->
+            <!-- ── GRAPH LAYOUT ───────────────────────────────────────────── -->
             <div class="lg-layout" id="lg-main-layout">
                 <!-- Legend + controls sidebar -->
                 <aside class="lg-sidebar">
@@ -262,7 +307,7 @@
                                 </marker>
                                 <marker id="arrow-conditional" markerWidth="8" markerHeight="8" refX="7" refY="3"
                                     orient="auto">
-                                    <path d="M0,0 L0,6 L8,3 z" fill="#9ca3af" />
+                                    <path d="M0,0 L0,6 L8,3 z" fill="#f59e0b" />
                                 </marker>
                                 <marker id="arrow-chain" markerWidth="9" markerHeight="9" refX="8" refY="3.5"
                                     orient="auto">
@@ -281,13 +326,19 @@
                     </div>
                 </div>
 
-                <!-- Node detail panel -->
-                <aside class="lg-detail-panel" id="lg-detail-panel">
-                    <div class="lg-panel-title">Node Details</div>
-                    <div id="lg-detail-content">
+                <!-- Agent / Node info panel (right sidebar) -->
+                <aside class="lg-info-panel" id="lg-info-panel">
+                    <div class="lg-info-panel-header">
+                        <div class="lg-info-panel-title">
+                            <i data-lucide="cpu"></i>
+                            <span>Agents &amp; Nodes</span>
+                        </div>
+                        <span class="lg-info-panel-count hidden" id="lg-info-count"></span>
+                    </div>
+                    <div id="lg-info-content" class="lg-info-content">
                         <div class="empty-state small">
-                            <i data-lucide="mouse-pointer-click"></i>
-                            <p>Click a node to inspect it</p>
+                            <i data-lucide="loader"></i>
+                            <p>Loading workflow…</p>
                         </div>
                     </div>
                 </aside>

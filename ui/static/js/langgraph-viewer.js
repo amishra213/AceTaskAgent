@@ -59,12 +59,14 @@ const LangGraphViewer = (() => {
             _render();
             _buildLegend();
             _buildStats();
+            _buildInfoPanel();
         } catch (e) {
             _root().innerHTML = `
                 <text x="50%" y="50%" fill="#ef4444" text-anchor="middle"
                       font-family="Inter,sans-serif" font-size="14">
                     Failed to load workflow: ${_esc(e.message)}
                 </text>`;
+            _buildInfoPanel(); // show empty state
         }
     }
 
@@ -264,28 +266,49 @@ const LangGraphViewer = (() => {
         const tx = tgt.x + NODE_W / 2 + offset;
         const ty = tgt.y;
 
+        // For decision → target edges, start from the diamond tip (bottom vertex)
+        const srcNode = _data.nodes.find(n => n.id === edge.source);
+        const tgtNode = _data.nodes.find(n => n.id === edge.target);
+        const fromDiamond = srcNode && srcNode.category === 'condition';
+        const toDiamond   = tgtNode && tgtNode.category === 'condition';
+
         // Determine style
         let stroke, dash, marker, width;
         if (edge.type === 'chain') {
             stroke = '#f97316'; dash = '8 4'; marker = 'url(#arrow-chain)'; width = 2.5;
         } else if (edge.type === 'conditional') {
-            stroke = '#9ca3af'; dash = '5 4'; marker = 'url(#arrow-conditional)'; width = 1.5;
+            stroke = '#f59e0b'; dash = '6 3'; marker = 'url(#arrow-conditional)'; width = 1.8;
         } else {
             stroke = '#6b7280'; dash = 'none'; marker = 'url(#arrow-direct)'; width = 2;
         }
 
         const g = _svgEl('g', { class: `lg-edge lg-edge-${edge.type}`, 'data-edge': edge.id });
 
-        // Bezier path
-        const cy1 = sy + (ty - sy) * 0.45;
-        const cy2 = ty - (ty - sy) * 0.45;
-        const d = `M ${sx},${sy} C ${sx},${cy1} ${tx},${cy2} ${tx},${ty}`;
+        // Adjust start/end points for diamond nodes (connect to the tip)
+        let ax = sx, ay = sy, bx = tx, by = ty;
+        if (fromDiamond) {
+            // bottom tip of diamond
+            ax = src.x + NODE_W / 2 + offset;
+            ay = src.y + NODE_H / 2 + (NODE_H / 2 - 2);
+        }
+        if (toDiamond) {
+            // top tip of diamond
+            bx = tgt.x + NODE_W / 2 + offset;
+            by = tgt.y + 2;
+        }
+
+        // Bezier control points — wider spread for conditional fan-out
+        const dy = by - ay;
+        const tension = fromDiamond ? 0.6 : 0.45;
+        const cy1 = ay + dy * tension;
+        const cy2 = by - dy * tension;
+        const d = `M ${ax},${ay} C ${ax},${cy1} ${bx},${cy2} ${bx},${by}`;
 
         const path = _svgEl('path', {
             d, fill: 'none', stroke, 'stroke-width': width,
             'stroke-dasharray': dash,
             'marker-end': marker,
-            opacity: '0.75',
+            opacity: edge.type === 'conditional' ? '0.85' : '0.75',
         });
         g.appendChild(path);
 
@@ -295,25 +318,39 @@ const LangGraphViewer = (() => {
         });
         g.appendChild(hitPath);
 
-        // Label on longer edges
-        if (edge.label) {
-            const midX = (sx + tx) / 2;
-            const midY = (sy + ty) / 2;
+        // Label on edge — show both branch key and condition expression if present
+        const labelText = edge.condition
+            ? `${edge.label} [${edge.condition}]`
+            : edge.label || '';
+
+        if (labelText) {
+            const midX = (ax + bx) / 2 + (bx - ax) * 0.05;
+            const midY = (ay + by) / 2;
+
+            // Estimate pill width
+            const textLen = Math.min(labelText.length, 28);
+            const pillW = Math.max(48, textLen * 5.8 + 10);
+            const pillH = 14;
+
             const bg = _svgEl('rect', {
-                x: midX - 40, y: midY - 8,
-                width: 80, height: 14,
-                rx: 3, fill: '#0f1117cc',
+                x: midX - pillW / 2, y: midY - pillH / 2,
+                width: pillW, height: pillH,
+                rx: 4,
+                fill: edge.type === 'conditional' ? '#f59e0b22' : '#0f1117cc',
+                stroke: edge.type === 'conditional' ? '#f59e0b55' : 'none',
+                'stroke-width': 1,
             });
+            const displayLabel = labelText.length > 28 ? labelText.slice(0, 27) + '…' : labelText;
             const txt = _svgEl('text', {
                 x: midX, y: midY + 1,
-                fill: stroke,
-                'font-size': '8.5',
+                fill: edge.type === 'conditional' ? '#fbbf24' : stroke,
+                'font-size': '8',
                 'font-family': 'Inter,sans-serif',
                 'text-anchor': 'middle',
                 'dominant-baseline': 'middle',
-                opacity: '0.9',
+                opacity: '0.95',
             });
-            txt.textContent = edge.label.length > 20 ? edge.label.slice(0, 19) + '…' : edge.label;
+            txt.textContent = displayLabel;
             g.appendChild(bg);
             g.appendChild(txt);
         }
@@ -323,7 +360,7 @@ const LangGraphViewer = (() => {
             path.setAttribute('stroke-width', String(width + 1.5));
         });
         g.addEventListener('mouseleave', () => {
-            path.setAttribute('opacity', '0.75');
+            path.setAttribute('opacity', edge.type === 'conditional' ? '0.85' : '0.75');
             path.setAttribute('stroke-width', String(width));
         });
 
@@ -343,6 +380,7 @@ const LangGraphViewer = (() => {
         const color = node.color || '#6b7280';
         const isEnd = node.id === '__end__';
         const isEntry = node.id === _data.entry_point;
+        const isDecision = node.category === 'condition';
 
         const g = _svgEl('g', {
             class: `lg-node lg-node-${node.category}`,
@@ -351,6 +389,88 @@ const LangGraphViewer = (() => {
             style: 'cursor:pointer',
         });
 
+        if (isDecision) {
+            // ── Diamond shape for condition/router nodes ──────────────────
+            const cx = NODE_W / 2;
+            const cy = NODE_H / 2;
+            const hw = NODE_W / 2 - 4;   // half-width of diamond
+            const hh = NODE_H / 2 - 2;   // half-height of diamond
+            const pts = `${cx},${cy - hh} ${cx + hw},${cy} ${cx},${cy + hh} ${cx - hw},${cy}`;
+
+            // Shadow
+            const shadow = _svgEl('polygon', {
+                points: `${cx + 3},${cy - hh + 4} ${cx + hw + 3},${cy + 4} ${cx + 3},${cy + hh + 4} ${cx - hw + 3},${cy + 4}`,
+                fill: 'rgba(0,0,0,0.45)',
+            });
+            g.appendChild(shadow);
+
+            // Body diamond
+            const body = _svgEl('polygon', {
+                points: pts,
+                fill: '#1a1d2e',
+                stroke: color,
+                'stroke-width': '2',
+            });
+            g.appendChild(body);
+
+            // Inner highlight ring
+            const hw2 = hw - 5; const hh2 = hh - 5;
+            const pts2 = `${cx},${cy - hh2} ${cx + hw2},${cy} ${cx},${cy + hh2} ${cx - hw2},${cy}`;
+            const inner = _svgEl('polygon', {
+                points: pts2,
+                fill: 'none',
+                stroke: color + '44',
+                'stroke-width': '1',
+            });
+            g.appendChild(inner);
+
+            // Icon ⋄ symbol
+            const iconTxt = _svgEl('text', {
+                x: cx, y: cy - 8,
+                fill: color,
+                'font-size': '13',
+                'font-family': 'Inter,sans-serif',
+                'font-weight': '700',
+                'text-anchor': 'middle',
+                'dominant-baseline': 'middle',
+            });
+            iconTxt.textContent = '⋄';
+            g.appendChild(iconTxt);
+
+            // Label
+            const labelEl = _svgEl('text', {
+                x: cx, y: cy + 7,
+                fill: '#e4e6f0',
+                'font-size': '10',
+                'font-family': 'Inter,sans-serif',
+                'font-weight': '600',
+                'text-anchor': 'middle',
+                'dominant-baseline': 'middle',
+            });
+            const raw = node.label || '';
+            labelEl.textContent = raw.length > 14 ? raw.slice(0, 13) + '…' : raw;
+            g.appendChild(labelEl);
+
+            // Events
+            g.addEventListener('click', (e) => { e.stopPropagation(); _selectNode(node); });
+            g.addEventListener('mouseenter', (ev) => {
+                body.setAttribute('fill', '#222540');
+                body.setAttribute('stroke-width', '3');
+                _showTooltip(ev, node);
+            });
+            g.addEventListener('mouseleave', () => {
+                if (!(_selected && _selected.id === node.id)) {
+                    body.setAttribute('fill', '#1a1d2e');
+                    body.setAttribute('stroke-width', '2');
+                }
+                _hideTooltip();
+            });
+            g.addEventListener('mousemove', (ev) => _moveTooltip(ev));
+            root.appendChild(g);
+            return;
+        }
+
+        // ── Standard rectangle node ───────────────────────────────────────
         // Drop shadow
         const shadow = _svgEl('rect', {
             x: 3, y: 4,
@@ -378,7 +498,6 @@ const LangGraphViewer = (() => {
             rx: 10,
             fill: color,
         });
-        // Clip the bottom radius of the accent bar
         const accentCover = _svgEl('rect', {
             x: 0, y: 3,
             width: NODE_W, height: 4,
@@ -395,7 +514,6 @@ const LangGraphViewer = (() => {
         });
         g.appendChild(iconCircle);
 
-        // Category initial letter as icon fallback
         const letter = _svgEl('text', {
             x: 26, y: NODE_H / 2 + 3,
             fill: color,
@@ -405,8 +523,7 @@ const LangGraphViewer = (() => {
             'text-anchor': 'middle',
             'dominant-baseline': 'middle',
         });
-        const iconChar = _iconChar(node);
-        letter.textContent = iconChar;
+        letter.textContent = _iconChar(node);
         g.appendChild(letter);
 
         // Label
@@ -526,18 +643,26 @@ const LangGraphViewer = (() => {
         _selected = node;
 
         // Reset all node styles
-        document.querySelectorAll('.lg-node rect:nth-child(2)').forEach(r => {
-            r.setAttribute('stroke-width', '1.5');
-        });
+        document.querySelectorAll('.lg-node rect:nth-child(2)').forEach(r => r.setAttribute('stroke-width', '1.5'));
+        document.querySelectorAll('.lg-node-condition polygon:nth-child(2)').forEach(p => p.setAttribute('stroke-width', '2'));
 
-        // Highlight selected
+        // Highlight selected node
         const g = _root().querySelector(`[data-id="${CSS.escape(node.id)}"]`);
         if (g) {
-            const body = g.querySelector('rect:nth-child(2)');
-            if (body) {
-                body.setAttribute('fill', '#222540');
-                body.setAttribute('stroke-width', '3');
-                body.setAttribute('filter', 'url(#glow)');
+            if (node.category === 'condition') {
+                const body = g.querySelector('polygon:nth-child(2)');
+                if (body) {
+                    body.setAttribute('fill', '#222540');
+                    body.setAttribute('stroke-width', '3');
+                    body.setAttribute('filter', 'url(#glow)');
+                }
+            } else {
+                const body = g.querySelector('rect:nth-child(2)');
+                if (body) {
+                    body.setAttribute('fill', '#222540');
+                    body.setAttribute('stroke-width', '3');
+                    body.setAttribute('filter', 'url(#glow)');
+                }
             }
         }
 
@@ -562,71 +687,147 @@ const LangGraphViewer = (() => {
             r.removeAttribute('filter');
             r.setAttribute('stroke-width', '1.5');
         });
+        document.querySelectorAll('.lg-node-condition polygon').forEach(p => {
+            p.removeAttribute('filter');
+            p.setAttribute('stroke-width', '2');
+        });
         _renderDetailEmpty();
     }
 
-    // ── Detail panel ─────────────────────────────────────────────────────────
-    function _renderDetail(node) {
-        const panel = document.getElementById('lg-detail-content');
-        if (!panel) return;
+    // ── Right panel: Agent / Node info list ──────────────────────────────────
+    function _buildInfoPanel() {
+        const container = document.getElementById('lg-info-content');
+        const countEl   = document.getElementById('lg-info-count');
+        if (!container) return;
 
-        const outEdges = _data.edges.filter(e => e.source === node.id);
-        const inEdges  = _data.edges.filter(e => e.target === node.id);
-        const chains   = (_data.chain_groups || []).filter(cg => cg.nodes.includes(node.id));
+        if (!_data || !_data.nodes || _data.nodes.length === 0) {
+            container.innerHTML = `<div class="empty-state small">
+                <i data-lucide="loader"></i><p>Loading workflow…</p></div>`;
+            if (countEl) countEl.classList.add('hidden');
+            lucide.createIcons();
+            return;
+        }
 
-        const edgeRow = (e, dir) => {
-            const other = dir === 'out' ? e.target : e.source;
-            const otherNode = _data.nodes.find(n => n.id === other);
-            const typeColor = e.type === 'chain' ? '#f97316' : e.type === 'conditional' ? '#9ca3af' : '#6b7280';
-            return `<div class="lg-detail-edge" onclick="LangGraphViewer.highlightNode('${_esc(other)}')">
-                <span class="lg-edge-badge" style="background:${typeColor}22;color:${typeColor};border-color:${typeColor}44">${e.type}</span>
-                <span class="lg-edge-dir">${dir === 'out' ? '→' : '←'}</span>
-                <span class="lg-edge-target">${_esc(otherNode?.label || other)}</span>
-                ${e.label ? `<span class="lg-edge-label-txt">${_esc(e.label)}</span>` : ''}
+        // All real nodes (no synthetic __decision__ nodes — show them only when
+        // a real node card is expanded)
+        const realNodes = _data.nodes.filter(n => !n.id.startsWith('__'));
+
+        if (countEl) {
+            countEl.textContent = realNodes.length;
+            countEl.classList.remove('hidden');
+        }
+
+        container.innerHTML = realNodes.map(node => {
+            const isDecision = node.category === 'condition';
+            const color      = node.color || '#6b7280';
+            const inEdges    = _data.edges.filter(e => e.target === node.id);
+            const outEdges   = _data.edges.filter(e => e.source === node.id);
+            const chains     = (_data.chain_groups || []).filter(cg => cg.nodes.includes(node.id));
+
+            // Router node for this node (if any)
+            const routerNode = _data.nodes.find(n => n.id === `__decision__${node.id}`);
+
+            // Quick props list
+            const props = [];
+            if (node.handler)     props.push(['handler',     node.handler,      true]);
+            if (node.chain)       props.push(['chain',       node.chain,        true]);
+            if (node.description && node.description !== '(no description)')
+                                  props.push(['description', node.description,  false]);
+            if (isDecision && node.router_name)
+                                  props.push(['router fn',   node.router_name,  true]);
+            if (node.lambda_body) props.push(['condition',   node.lambda_body,  true]);
+            if (chains.length)    props.push(['group',       chains.map(c => c.label).join(', '), false]);
+
+            const propsHtml = props.map(([k, v, mono]) =>
+                `<div class="lg-ic-prop">
+                    <span class="lg-ic-key">${k}</span>
+                    ${mono ? `<code class="lg-ic-val-code">${_esc(v)}</code>`
+                           : `<span class="lg-ic-val">${_esc(v)}</span>`}
+                </div>`
+            ).join('');
+
+            // Router branches (if this node has a decision router attached)
+            let routingHtml = '';
+            if (routerNode && routerNode.router_branches && routerNode.router_branches.length) {
+                routingHtml = `<div class="lg-ic-section-title">Routing branches</div>
+                <div class="lg-ic-branches">${routerNode.router_branches.map((b, i) =>
+                    `<div class="lg-ic-branch">
+                        <span class="lg-ic-branch-num">${i + 1}</span>
+                        <span class="lg-ic-branch-cond">${_esc(b.condition)}</span>
+                        <span class="lg-ic-branch-arrow">→</span>
+                        <span class="lg-ic-branch-ret">${_esc(b.returns)}</span>
+                    </div>`
+                ).join('')}</div>`;
+            }
+
+            // Edges section (collapsed until card is active)
+            const edgesHtml = (inEdges.length + outEdges.length) > 0 ? `
+                <div class="lg-ic-edges">
+                    ${inEdges.length ? `<div class="lg-ic-section-title">← Incoming (${inEdges.length})</div>
+                    ${inEdges.map(e => {
+                        const src = _data.nodes.find(n => n.id === e.source);
+                        const typeColor = e.type === 'chain' ? '#f97316' : e.type === 'conditional' ? '#f59e0b' : '#6b7280';
+                        return `<div class="lg-ic-edge" onclick="LangGraphViewer.highlightNode('${_esc(e.source)}')">
+                            <span class="lg-ic-edge-badge" style="color:${typeColor}">${e.type}</span>
+                            <span class="lg-ic-edge-node">${_esc(src?.label || e.source)}</span>
+                            ${e.condition ? `<span class="lg-ic-edge-cond">${_esc(e.condition)}</span>` : ''}
+                        </div>`;
+                    }).join('')}` : ''}
+                    ${outEdges.length ? `<div class="lg-ic-section-title">→ Outgoing (${outEdges.length})</div>
+                    ${outEdges.map(e => {
+                        const tgt = _data.nodes.find(n => n.id === e.target);
+                        const typeColor = e.type === 'chain' ? '#f97316' : e.type === 'conditional' ? '#f59e0b' : '#6b7280';
+                        return `<div class="lg-ic-edge" onclick="LangGraphViewer.highlightNode('${_esc(e.target)}')">
+                            <span class="lg-ic-edge-badge" style="color:${typeColor}">${e.type}</span>
+                            <span class="lg-ic-edge-node">${_esc(tgt?.label || e.target)}</span>
+                            ${e.condition ? `<span class="lg-ic-edge-cond">${_esc(e.condition)}</span>` : ''}
+                        </div>`;
+                    }).join('')}` : ''}
+                </div>` : '';
+
+            return `<div class="lg-ic-card" id="lg-ic-${_esc(node.id)}" style="--node-color:${color}"
+                         onclick="LangGraphViewer.highlightNode('${_esc(node.id)}')">
+                <div class="lg-ic-header">
+                    <span class="lg-ic-icon" style="background:${color}22;color:${color}">
+                        ${isDecision ? '⋄' : _iconChar(node)}
+                    </span>
+                    <div class="lg-ic-title-block">
+                        <span class="lg-ic-name">${_esc(node.label || node.id)}</span>
+                        <span class="lg-ic-badge" style="background:${color}20;color:${color}">${_esc(node.category)}</span>
+                    </div>
+                    <div class="lg-ic-edge-pips">
+                        <span class="lg-ic-pip lg-ic-pip-in" title="${inEdges.length} incoming">${inEdges.length}</span>
+                        <span class="lg-ic-pip lg-ic-pip-out" title="${outEdges.length} outgoing">${outEdges.length}</span>
+                    </div>
+                </div>
+                <div class="lg-ic-body">
+                    ${propsHtml}
+                    ${routingHtml}
+                    ${edgesHtml}
+                </div>
             </div>`;
-        };
+        }).join('');
 
-        panel.innerHTML = `
-            <div class="lg-detail-header" style="border-color:${node.color}">
-                <span class="lg-detail-icon" style="background:${node.color}22;color:${node.color}">${_iconChar(node)}</span>
-                <div>
-                    <div class="lg-detail-name">${_esc(node.label)}</div>
-                    <div class="lg-detail-category" style="color:${node.color}">${_esc(node.category)}</div>
-                </div>
-            </div>
-            <div class="lg-detail-desc">${_esc(node.description)}</div>
-
-            ${inEdges.length > 0 ? `
-            <div class="lg-detail-section-title">Incoming (${inEdges.length})</div>
-            <div class="lg-detail-edges">${inEdges.map(e => edgeRow(e, 'in')).join('')}</div>
-            ` : ''}
-
-            ${outEdges.length > 0 ? `
-            <div class="lg-detail-section-title">Outgoing (${outEdges.length})</div>
-            <div class="lg-detail-edges">${outEdges.map(e => edgeRow(e, 'out')).join('')}</div>
-            ` : ''}
-
-            ${chains.length > 0 ? `
-            <div class="lg-detail-section-title">Chain Groups</div>
-            ${chains.map(cg => `
-                <div class="lg-detail-chain" style="border-color:${cg.color}55;background:${cg.color}0d">
-                    <div style="color:${cg.color};font-weight:600;font-size:11px">${_esc(cg.label)}</div>
-                    <div style="color:var(--text-muted);font-size:10.5px;margin-top:3px">${_esc(cg.description)}</div>
-                </div>
-            `).join('')}
-            ` : ''}
-        `;
         lucide.createIcons();
     }
 
+    function _highlightInfoCard(nodeId) {
+        // Remove previous active state
+        document.querySelectorAll('.lg-ic-card.active').forEach(c => c.classList.remove('active'));
+        if (!nodeId) return;
+        const card = document.getElementById(`lg-ic-${nodeId}`);
+        if (!card) return;
+        card.classList.add('active');
+        card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+
+    // Legacy detail panel functions — now delegate to card highlight
+    function _renderDetail(node) {
+        _highlightInfoCard(node.id);
+    }
+
     function _renderDetailEmpty() {
-        const panel = document.getElementById('lg-detail-content');
-        if (panel) panel.innerHTML = `
-            <div class="empty-state small">
-                <i data-lucide="mouse-pointer-click"></i>
-                <p>Click a node to inspect it</p>
-            </div>`;
-        lucide.createIcons();
+        _highlightInfoCard(null);
     }
 
     // ── Legend ───────────────────────────────────────────────────────────────
@@ -638,7 +839,10 @@ const LangGraphViewer = (() => {
         if (catEl && _data.categories) {
             catEl.innerHTML = Object.entries(_data.categories).map(([k, v]) => `
                 <div class="lg-legend-row">
-                    <span class="lg-legend-dot" style="background:${v.color}"></span>
+                    ${k === 'condition'
+                        ? `<svg width="14" height="14" style="flex-shrink:0"><polygon points="7,1 13,7 7,13 1,7" fill="none" stroke="${v.color}" stroke-width="1.5"/></svg>`
+                        : `<span class="lg-legend-dot" style="background:${v.color}"></span>`
+                    }
                     <span class="lg-legend-label">${_esc(v.label)}</span>
                 </div>
             `).join('');
@@ -651,8 +855,8 @@ const LangGraphViewer = (() => {
                 <div class="lg-legend-row">
                     <svg width="28" height="10" style="flex-shrink:0">
                         <line x1="0" y1="5" x2="28" y2="5"
-                              stroke="${v.color}" stroke-width="${k === 'chain' ? 2.5 : k === 'direct' ? 2 : 1.5}"
-                              stroke-dasharray="${k === 'chain' ? '7 3' : k === 'conditional' ? '4 3' : 'none'}"/>
+                              stroke="${v.color}" stroke-width="${k === 'chain' ? 2.5 : k === 'direct' ? 2 : 1.8}"
+                              stroke-dasharray="${k === 'chain' ? '7 3' : k === 'conditional' ? '5 2' : 'none'}"/>
                     </svg>
                     <span class="lg-legend-label">${_esc(v.label)}</span>
                 </div>
@@ -676,15 +880,17 @@ const LangGraphViewer = (() => {
     function _buildStats() {
         const el = document.getElementById('lg-stats');
         if (!el || !_data) return;
-        const nNodes = _data.nodes.length;
-        const nEdges = _data.edges.length;
-        const nChains = (_data.chain_groups || []).length;
+        const nNodes     = _data.nodes.filter(n => n.category !== 'condition').length;
+        const nEdges     = _data.edges.length;
+        const nChains    = (_data.chain_groups || []).length;
         const nSubagents = _data.nodes.filter(n => n.category === 'subagent').length;
+        const nDecisions = _data.nodes.filter(n => n.category === 'condition').length;
         el.innerHTML = `
             <div class="lg-stat"><span class="lg-stat-val">${nNodes}</span><span class="lg-stat-lbl">Nodes</span></div>
             <div class="lg-stat"><span class="lg-stat-val">${nEdges}</span><span class="lg-stat-lbl">Edges</span></div>
             <div class="lg-stat"><span class="lg-stat-val">${nSubagents}</span><span class="lg-stat-lbl">Sub-agents</span></div>
-            <div class="lg-stat"><span class="lg-stat-val">${nChains}</span><span class="lg-stat-lbl">Chains</span></div>
+            <div class="lg-stat"><span class="lg-stat-val">${nDecisions}</span><span class="lg-stat-lbl">Decisions</span></div>
+            ${nChains > 0 ? `<div class="lg-stat"><span class="lg-stat-val">${nChains}</span><span class="lg-stat-lbl">Chains</span></div>` : ''}
         `;
     }
 
@@ -728,8 +934,11 @@ const LangGraphViewer = (() => {
     function _applyTransform() {
         const root = _root();
         root.setAttribute('transform', `translate(${_panX},${_panY}) scale(${_zoom})`);
-        const lbl = document.getElementById('lg-zoom-level');
-        if (lbl) lbl.textContent = Math.round(_zoom * 100) + '%';
+        // Update all zoom percentage labels (main toolbar + diagram toolbar)
+        const pct = Math.round(_zoom * 100) + '%';
+        document.querySelectorAll('#lg-zoom-level, .lg-zoom-display').forEach(el => {
+            el.textContent = pct;
+        });
     }
 
     function _setupSvgInteraction() {
@@ -838,45 +1047,82 @@ const LangGraphViewer = (() => {
         if (!_data) {
             init();
         } else {
-            // Re-fit on re-activation in case container resized
             setTimeout(fit, 80);
         }
     }
 
-    // ── Parse-Code Tab ───────────────────────────────────────────────────────
+    // ── Tab mode ─────────────────────────────────────────────────────────────
 
-    let _mode = 'live';   // 'live' | 'parse'
+    let _mode = 'workflow';   // 'workflow' | 'summary'
+    let _isCustomCode = false; // true when user has parsed custom code (not live data)
 
     function switchTab(tab) {
         _mode = tab;
-        const parsePanel  = document.getElementById('lg-parse-panel');
-        const mainLayout  = document.getElementById('lg-main-layout');
-        const tabLive     = document.getElementById('lg-tab-live');
-        const tabParse    = document.getElementById('lg-tab-parse');
-        const graphActs   = document.getElementById('lg-graph-actions');
-        const parseActs   = document.getElementById('lg-parse-actions');
-        const subtitle    = document.getElementById('lg-subtitle');
+        const summaryPanel = document.getElementById('lg-summary-panel');
+        const mainLayout   = document.getElementById('lg-main-layout');
+        const tabWorkflow  = document.getElementById('lg-tab-workflow');
+        const tabSummary   = document.getElementById('lg-tab-summary');
+        const graphActs    = document.getElementById('lg-graph-actions');
+        const subtitle     = document.getElementById('lg-subtitle');
 
-        if (tab === 'parse') {
-            parsePanel  && parsePanel.classList.remove('hidden');
-            mainLayout  && mainLayout.classList.add('hidden');
-            tabLive     && tabLive.classList.remove('active');
-            tabParse    && tabParse.classList.add('active');
-            graphActs   && graphActs.classList.add('hidden');
-            parseActs   && parseActs.classList.remove('hidden');
-            if (subtitle) subtitle.textContent = 'Paste or upload any LangGraph Python code to generate a visual diagram';
+        // ── Reset all panels / tabs ───────────────────────────────────────
+        summaryPanel && summaryPanel.classList.add('hidden');
+        mainLayout   && mainLayout.classList.remove('hidden');
+
+        tabWorkflow && tabWorkflow.classList.remove('active');
+        tabSummary  && tabSummary.classList.remove('active');
+
+        graphActs   && graphActs.classList.remove('hidden');
+
+        if (tab === 'summary') {
+            // ── Code Summary tab ──────────────────────────────────────────
+            mainLayout   && mainLayout.classList.add('hidden');
+            summaryPanel && summaryPanel.classList.remove('hidden');
+            tabSummary   && tabSummary.classList.add('active');
+            graphActs    && graphActs.classList.add('hidden');
+            if (subtitle) subtitle.textContent = 'Code summary — agents, sub-agents, edges and routing';
+
         } else {
-            parsePanel  && parsePanel.classList.add('hidden');
-            mainLayout  && mainLayout.classList.remove('hidden');
-            tabLive     && tabLive.classList.add('active');
-            tabParse    && tabParse.classList.remove('active');
-            graphActs   && graphActs.classList.remove('hidden');
-            parseActs   && parseActs.classList.add('hidden');
-            if (subtitle) subtitle.textContent = 'Live topology of agents and interactions read from source code';
-            // If the graph wasn't rendered yet, load live data
+            // ── Workflow tab (default) ────────────────────────────────────
+            tabWorkflow && tabWorkflow.classList.add('active');
+            if (subtitle) {
+                subtitle.textContent = _isCustomCode
+                    ? 'Showing parsed custom code — click "Live" in the toolbar to reload the live workflow'
+                    : 'Live topology of agents and interactions read from source code';
+            }
             if (!_data) init();
             else setTimeout(fit, 80);
         }
+    }
+
+    // ── Code drawer ──────────────────────────────────────────────────────────
+
+    let _drawerOpen = false;
+
+    function toggleCodeDrawer() {
+        const drawer     = document.getElementById('lg-code-drawer');
+        const toggleBtn  = document.getElementById('lg-btn-code-toggle');
+        if (!drawer) return;
+        _drawerOpen = !_drawerOpen;
+        drawer.classList.toggle('hidden', !_drawerOpen);
+        if (toggleBtn) toggleBtn.classList.toggle('active', _drawerOpen);
+    }
+
+    async function reloadLive() {
+        _isCustomCode = false;
+        _clearParseStatus();
+        // Hide Summary tab and source badge
+        const tabSummary = document.getElementById('lg-tab-summary');
+        const reloadBtn  = document.getElementById('lg-btn-reload-live');
+        if (tabSummary) tabSummary.classList.add('hidden');
+        if (reloadBtn)  reloadBtn.classList.add('hidden');
+        _hideSourceBadge();
+        // Close the code drawer if open
+        const drawer = document.getElementById('lg-code-drawer');
+        if (drawer && !drawer.classList.contains('hidden')) toggleCodeDrawer();
+        // Re-run the live data fetch
+        switchTab('workflow');
+        await init();
     }
 
     function _setParseStatus(type, html) {
@@ -923,13 +1169,11 @@ const LangGraphViewer = (() => {
             _loadParsed(res);
         } catch (err) {
             let msg = err.message || String(err);
-            // Try to extract server detail
             try {
                 const detail = JSON.parse(msg);
                 if (detail.detail) msg = detail.detail;
             } catch (_) { /* ignore */ }
-            _setParseStatus('error',
-                `<b>Parse error:</b> ${_esc(msg)}`);
+            _setParseStatus('error', `<b>Parse error:</b> ${_esc(msg)}`);
         }
     }
 
@@ -941,8 +1185,8 @@ const LangGraphViewer = (() => {
             const ta = document.getElementById('lg-code-input');
             if (ta) ta.value = e.target.result;
             _clearParseStatus();
-            // Automatically switch to parse tab and trigger parse
-            if (_mode !== 'parse') switchTab('parse');
+            // Open the drawer so the user can review + click Parse
+            if (!_drawerOpen) toggleCodeDrawer();
         };
         reader.onerror = () => {
             _setParseStatus('error', 'Failed to read file.');
@@ -959,18 +1203,29 @@ const LangGraphViewer = (() => {
     function _loadParsed(data) {
         const summary = data.parse_summary || {};
         _data = data;
+        _isCustomCode = true;
         _buildLayout();
         _render();
         _buildLegend();
         _buildStats();
 
-        // Switch view to graph
-        const parsePanel  = document.getElementById('lg-parse-panel');
-        const mainLayout  = document.getElementById('lg-main-layout');
-        if (parsePanel) parsePanel.classList.add('hidden');
-        if (mainLayout) mainLayout.classList.remove('hidden');
+        // Render the Code Summary panel
+        _renderSummaryPanel(data);
 
-        setTimeout(fit, 80);
+        // Rebuild the right-panel agent info list
+        _buildInfoPanel();
+
+        // Show Summary tab button and the "Live" reset button
+        const tabSummary = document.getElementById('lg-tab-summary');
+        const reloadBtn  = document.getElementById('lg-btn-reload-live');
+        if (tabSummary) tabSummary.classList.remove('hidden');
+        if (reloadBtn)  reloadBtn.classList.remove('hidden');
+
+        // Close the drawer (graph is now showing)
+        if (_drawerOpen) toggleCodeDrawer();
+
+        // Switch to Code Summary to show parsed results
+        switchTab('summary');
 
         // Show success status and source badge
         const filename = summary.filename || '(pasted code)';
@@ -1016,10 +1271,14 @@ class AgentState(TypedDict):
 
 def route_task(state):
     t = state.get("task_type", "")
-    if t == "search":   return "web_search"
-    if t == "document": return "document_agent"
-    if t == "code":     return "code_interpreter"
-    return "default_handler"
+    if t == "search":
+        return "web_search"
+    elif t == "document":
+        return "document_agent"
+    elif t == "code":
+        return "code_interpreter"
+    else:
+        return "default_handler"
 
 workflow = StateGraph(AgentState)
 workflow.add_node("initialize",       initialize_fn)
@@ -1061,11 +1320,13 @@ class MultiAgentState(TypedDict):
 
 def route_after_planning(state):
     subtasks = state.get("subtasks", [])
-    if len(subtasks) == 0: return "handle_error"
+    if len(subtasks) == 0:
+        return "handle_error"
     return "dispatch_agents"
 
 def route_after_synthesis(state):
-    if state.get("errors"): return "review_errors"
+    if state.get("errors"):
+        return "review_errors"
     return "finalize"
 
 graph = StateGraph(MultiAgentState)
@@ -1139,6 +1400,133 @@ graph.add_edge("handle_error",  END)
         }
     }
 
+    // ── Agent Info Panel ─────────────────────────────────────────────────────
+    // ── Code Summary Panel ───────────────────────────────────────────────────
+    function _renderSummaryPanel(data) {
+        const summary   = data.parse_summary || {};
+        const nodes     = data.nodes  || [];
+        const edges     = data.edges  || [];
+
+        // ─ Stats bar ─────────────────────────────────────────────────────
+        const statsEl   = document.getElementById('lg-summary-stats');
+        const fileEl    = document.getElementById('lg-summary-filename');
+        const filename  = summary.filename || '(pasted code)';
+        if (fileEl) fileEl.textContent = filename;
+
+        const agentNodes = nodes.filter(n => !n.id.startsWith('__'));
+        const condNodes  = nodes.filter(n => n.category === 'condition');
+        const directEdges      = edges.filter(e => e.type === 'direct');
+        const conditionalEdges = edges.filter(e => e.type === 'conditional');
+
+        if (statsEl) {
+            statsEl.innerHTML = [
+                _statChip('cpu',       agentNodes.length,      'Agents / Nodes'),
+                _statChip('git-branch',condNodes.length,       'Condition Routers'),
+                _statChip('arrow-right',directEdges.length,    'Direct Edges'),
+                _statChip('git-merge', conditionalEdges.length,'Conditional Edges'),
+                summary.entry_point ? _statChip('play', summary.entry_point, 'Entry Point') : '',
+                summary.finish_point ? _statChip('square', summary.finish_point, 'Exit Point') : '',
+            ].join('');
+        }
+
+        // ─ Nodes count badge ─────────────────────────────────────────────
+        const nodeCount = document.getElementById('lg-summary-node-count');
+        if (nodeCount) nodeCount.textContent = agentNodes.length;
+
+        // ─ Edge count badge ───────────────────────────────────────────────
+        const edgeCount = document.getElementById('lg-summary-edge-count');
+        if (edgeCount) edgeCount.textContent = edges.length;
+
+        // ─ Agent / node cards ─────────────────────────────────────────────
+        const nodesEl = document.getElementById('lg-summary-nodes');
+        if (nodesEl) {
+            if (agentNodes.length === 0) {
+                nodesEl.innerHTML = '<p class="lg-summary-empty">No agents found.</p>';
+            } else {
+                nodesEl.innerHTML = agentNodes.map(n => {
+                    const color    = n.color || '#6b7280';
+                    const category = n.category || 'node';
+                    const incoming = edges.filter(e => e.target === n.id || e.to === n.id).length;
+                    const outgoing = edges.filter(e => e.source === n.id || e.from === n.id).length;
+                    // Collect condition branches if this is a router source
+                    const routedBy = nodes.find(c => c.category === 'condition' &&
+                        c.id === `__decision__${n.id}`);
+                    const branches = routedBy ? (routedBy.router_branches || []) : [];
+
+                    return `
+                    <div class="lg-snode-card" style="border-left-color:${color}">
+                        <div class="lg-snode-header">
+                            <span class="lg-snode-name">${_esc(n.id)}</span>
+                            <span class="lg-snode-badge" style="background:${color}20;color:${color}">${_esc(category)}</span>
+                        </div>
+                        <div class="lg-snode-props">
+                            ${n.handler ? `<div class="lg-snode-prop"><span class="lg-prop-key">handler</span><code class="lg-prop-val">${_esc(n.handler)}</code></div>` : ''}
+                            ${n.description && n.description !== '(no description)' ? `<div class="lg-snode-prop"><span class="lg-prop-key">description</span><span class="lg-prop-val">${_esc(n.description)}</span></div>` : ''}
+                            ${n.label && n.label !== n.id ? `<div class="lg-snode-prop"><span class="lg-prop-key">label</span><span class="lg-prop-val">${_esc(n.label)}</span></div>` : ''}
+                            ${n.chain ? `<div class="lg-snode-prop"><span class="lg-prop-key">chain</span><code class="lg-prop-val">${_esc(n.chain)}</code></div>` : ''}
+                            ${n.router_name ? `<div class="lg-snode-prop"><span class="lg-prop-key">router</span><code class="lg-prop-val">${_esc(n.router_name)}</code></div>` : ''}
+                            ${n.lambda_body ? `<div class="lg-snode-prop"><span class="lg-prop-key">condition</span><code class="lg-prop-val lg-prop-code">${_esc(n.lambda_body)}</code></div>` : ''}
+                            <div class="lg-snode-prop">
+                                <span class="lg-prop-key">edges</span>
+                                <span class="lg-prop-val">
+                                    <span class="lg-edge-pip lg-pip-in">${incoming} in</span>
+                                    <span class="lg-edge-pip lg-pip-out">${outgoing} out</span>
+                                </span>
+                            </div>
+                            ${branches.length ? `<div class="lg-snode-prop"><span class="lg-prop-key">branches</span><span class="lg-prop-val">${branches.map(b => `<span class="lg-branch-tag">${_esc(b)}</span>`).join(' ')}</span></div>` : ''}
+                        </div>
+                    </div>`;
+                }).join('');
+            }
+        }
+
+        // ─ Edge / routing table ───────────────────────────────────────────
+        const edgesEl = document.getElementById('lg-summary-edges');
+        if (edgesEl) {
+            if (edges.length === 0) {
+                edgesEl.innerHTML = '<p class="lg-summary-empty">No edges found.</p>';
+            } else {
+                // Group: direct first, then conditional
+                const sorted = [...edges].sort((a, b) => {
+                    const ta = a.type || 'direct', tb = b.type || 'direct';
+                    if (ta === tb) return 0;
+                    return ta === 'direct' ? -1 : 1;
+                });
+                let html = '<table class="lg-edge-table"><thead><tr>'
+                    + '<th>From</th><th></th><th>To</th><th>Type</th><th>Condition</th>'
+                    + '</tr></thead><tbody>';
+                for (const e of sorted) {
+                    const src  = e.source || e.from || '?';
+                    const tgt  = e.target || e.to   || '?';
+                    const type = e.type   || 'direct';
+                    const cond = e.condition || e.label || '';
+                    const arrow = type === 'conditional' ? '⟶' : '→';
+                    const cls   = type === 'conditional' ? 'lg-etype-cond' : 'lg-etype-dir';
+                    html += `<tr>
+                        <td><code class="lg-edge-node">${_esc(src)}</code></td>
+                        <td class="lg-edge-arrow">${arrow}</td>
+                        <td><code class="lg-edge-node">${_esc(tgt)}</code></td>
+                        <td><span class="lg-edge-type ${cls}">${_esc(type)}</span></td>
+                        <td class="lg-edge-cond">${cond ? _esc(cond) : ''}</td>
+                    </tr>`;
+                }
+                html += '</tbody></table>';
+                edgesEl.innerHTML = html;
+            }
+        }
+
+        // Re-initialize lucide icons
+        if (typeof lucide !== 'undefined' && lucide.createIcons) lucide.createIcons();
+    }
+
+    function _statChip(icon, value, label) {
+        return `<div class="lg-stat-chip">
+            <i data-lucide="${icon}"></i>
+            <span class="lg-stat-chip-val">${_esc(String(value))}</span>
+            <span class="lg-stat-chip-label">${label}</span>
+        </div>`;
+    }
+
     return {
         init,
         fit,
@@ -1150,6 +1538,8 @@ graph.add_edge("handle_error",  END)
         highlightChain,
         onActivate,
         switchTab,
+        toggleCodeDrawer,
+        reloadLive,
         parseFromInput,
         loadFile,
         clearInput,
